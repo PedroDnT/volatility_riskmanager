@@ -9,6 +9,26 @@ import numpy as np
 import pandas as pd
 import ccxt
 
+# --- New config loader (optional best-effort) ---
+try:
+    import tomllib  # Python 3.11+
+except Exception:
+    tomllib = None
+
+def load_settings(path: str = "settings.toml") -> dict:
+    if not tomllib:
+        return {}
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except Exception:
+        # fallback to example if present
+        try:
+            with open("settings.example.toml", "rb") as f:
+                return tomllib.load(f)
+        except Exception:
+            return {}
+
 # ---------- CCXT Bybit Data Fetcher ----------
 
 def get_live_price_bybit(symbol="BTC/USDT", sandbox=False):
@@ -267,7 +287,76 @@ def garch_sigma_ann_and_sigma_H(prices: pd.Series, interval="1h", horizon_hours=
     sigma_H = sigma_ann * math.sqrt(horizon_hours / hours_per_year)
     return sigma_ann, sigma_H, res
 
-# ---------- Dynamic SL/TP and Position Sizing (same as before) ----------
+# ---------- New: Volatility blending & outlier clamp ----------
+
+HOURS_PER_YEAR = 365 * 24
+
+def _ann_to_horizon_sigma(sig_ann: float, horizon_hours: int) -> float:
+    return float(sig_ann) * math.sqrt(horizon_hours / HOURS_PER_YEAR)
+
+def blended_sigma_h(sigma_ann_garch: float | None,
+                    sigma_ann_har: float | None,
+                    atr_abs: float,
+                    price: float,
+                    cfg: dict) -> float:
+    vol_cfg = (cfg or {}).get('vol', {})
+    horizon_hours = int(vol_cfg.get('horizon_hours', 4))
+    w_g = float(vol_cfg.get('blend_w_garch', 0.30))
+    w_h = float(vol_cfg.get('blend_w_har', 0.40))
+    w_a = float(vol_cfg.get('blend_w_atr', 0.30))
+    outlier_ratio = float(vol_cfg.get('garch_har_outlier_ratio', 2.0))
+
+    sigH_garch = _ann_to_horizon_sigma(sigma_ann_garch, horizon_hours) if sigma_ann_garch else None
+    sigH_har   = _ann_to_horizon_sigma(sigma_ann_har,   horizon_hours) if sigma_ann_har else None
+    sigH_atr   = float(atr_abs)
+
+    if sigma_ann_har and sigma_ann_garch and (sigma_ann_garch > outlier_ratio * sigma_ann_har):
+        w_g = w_g * 0.3
+        s = w_g + w_h + w_a
+        w_g, w_h, w_a = w_g/s, w_h/s, w_a/s
+
+    parts = []
+    weights = []
+    if sigH_garch is not None:
+        parts.append(sigH_garch); weights.append(w_g)
+    if sigH_har is not None:
+        parts.append(sigH_har);   weights.append(w_h)
+    # ATR available always
+    parts.append(sigH_atr); weights.append(w_a)
+
+    if not parts or sum(weights) == 0:
+        return sigH_atr
+    # Normalize weights of available components
+    s = sum(weights)
+    weights = [w/s for w in weights]
+    sigH_blend = sum(w*p for w,p in zip(weights, parts))
+    return sigH_blend
+
+# ---------- New: GARCH sanity validator ----------
+
+def validate_garch_result(returns: np.ndarray, res, sigma_ann: float, horizon_hours: int) -> list[str]:
+    issues: list[str] = []
+    if np.isnan(returns).any() or np.isinf(returns).any():
+        issues.append("NaN/Inf in returns")
+    if abs(np.mean(returns)) > 5e-3:
+        issues.append("Large mean in returns; did you use raw prices?")
+
+    params = getattr(res, "params", {})
+    omega = params.get("omega", None)
+    alpha = params.get("alpha[1]", params.get("alpha", None))
+    beta  = params.get("beta[1]",  params.get("beta",  None))
+    if omega is not None and omega <= 0: issues.append("omega <= 0")
+    if alpha is not None and alpha < 0:  issues.append("alpha < 0")
+    if beta  is not None and beta  < 0:  issues.append("beta < 0")
+    if (alpha is not None) and (beta is not None) and (alpha + beta) >= 1.0:
+        issues.append("alpha+beta >= 1 (non-stationary)")
+
+    sigH = _ann_to_horizon_sigma(sigma_ann, horizon_hours)
+    if (sigH <= 0) or (sigH > 0.50):
+        issues.append(f"Horizon sigma out of range: {sigH:.3f}")
+    return issues
+
+# ---------- Dynamic SL/TP and Position Sizing (same as before, but helpers will be used upstream) ----------
 
 def sl_tp_and_size(entry_price, sigma_H, k=1.2, m=2.0, side="long", R=100.0, tick_size=None):
     """
@@ -304,6 +393,18 @@ def sl_tp_and_size(entry_price, sigma_H, k=1.2, m=2.0, side="long", R=100.0, tic
         "Q": Q
     }
 
+# ---------- New: trailing stop helper ----------
+
+def compute_trailing_stop(entry: float, direction: str, atr: float, cfg: dict, r_unrealized: float) -> float:
+    stops_cfg = (cfg or {}).get('stops', {})
+    trail_initial = float(stops_cfg.get('atr_trail_mult_initial', 2.0))
+    trail_late    = float(stops_cfg.get('atr_trail_mult_late', 1.5))
+    trail_mult = trail_late if r_unrealized >= 2.0 else trail_initial
+    if direction == "long":
+        return max(entry - atr * trail_mult, 0.0)
+    else:
+        return entry + atr * trail_mult
+
 # ---------- Enhanced example with multiple symbols ----------
 
 def analyze_multiple_symbols_bybit(symbols=["BTC/USDT", "ETH/USDT"], timeframe="4h", days_back=120, sandbox=False):
@@ -338,15 +439,20 @@ def analyze_multiple_symbols_bybit(symbols=["BTC/USDT", "ETH/USDT"], timeframe="
             print(f"[HAR] sigma_ann={sigma_ann_har:.2%}, sigma_H({H_hours}h)={sigma_H_har:.2%}")
         except Exception as e:
             print(f"HAR failed: {e}")
-            sigma_H_har = None
+            sigma_ann_har, sigma_H_har = None, None
         
         # GARCH analysis
         try:
             sigma_ann_garch, sigma_H_garch, garch_res = garch_sigma_ann_and_sigma_H(df["close"], interval=timeframe, horizon_hours=H_hours)
             print(f"[GARCH] sigma_ann={sigma_ann_garch:.2%}, sigma_H({H_hours}h)={sigma_H_garch:.2%}")
+            # Validate
+            rets = np.log(df["close"]).diff().dropna().values
+            issues = validate_garch_result(rets, garch_res, sigma_ann_garch, H_hours)
+            if issues:
+                print("GARCH checks:", "; ".join(issues))
         except Exception as e:
             print(f"GARCH failed: {e}")
-            sigma_H_garch = None
+            sigma_ann_garch, sigma_H_garch = None, None
         
         # Get live price for current analysis
         live_price = get_live_price_bybit(symbol, sandbox=sandbox)
@@ -357,29 +463,25 @@ def analyze_multiple_symbols_bybit(symbols=["BTC/USDT", "ETH/USDT"], timeframe="
             entry_price = live_price
             print(f"Live price for {symbol}: ${entry_price:.2f}")
         
+        # Blended sigma using ATR abs
+        atr = float(df["ATR20"].iloc[-1])
+        cfg = load_settings()
+        sigmaH_blend_abs = blended_sigma_h(sigma_ann_garch, sigma_ann_har, atr_abs=atr, price=entry_price, cfg=cfg)
+        sigmaH_blend_frac = sigmaH_blend_abs / entry_price
+        
         risk_R = 200.0
         
         strategies = {}
-        
-        if sigma_H_har:
-            strategies["HAR_trend"] = sl_tp_and_size(entry_price, sigma_H=sigma_H_har, k=1.2, m=2.2, side="long", R=risk_R, tick_size=tick_size)
-            strategies["HAR_meanrev"] = sl_tp_and_size(entry_price, sigma_H=sigma_H_har, k=1.0, m=1.5, side="long", R=risk_R, tick_size=tick_size)
-        
-        if sigma_H_garch:
-            strategies["GARCH_trend"] = sl_tp_and_size(entry_price, sigma_H=sigma_H_garch, k=1.2, m=2.2, side="long", R=risk_R, tick_size=tick_size)
-        
-        # ATR-based
-        atr = float(df["ATR20"].iloc[-1])
-        sigma_atr = atr / entry_price
-        strategies["ATR_trend"] = sl_tp_and_size(entry_price, sigma_H=sigma_atr, k=1.0, m=1.8, side="long", R=risk_R, tick_size=tick_size)
+        strategies["VOL_BLEND"] = sl_tp_and_size(entry_price, sigma_H=sigmaH_blend_frac, k=1.2, m=2.2, side="long", R=risk_R, tick_size=tick_size)
         
         results[symbol] = {
             'market_info': market_info,
             'entry_price': entry_price,
             'strategies': strategies,
-            'sigma_ann_har': sigma_ann_har if sigma_H_har else None,
-            'sigma_ann_garch': sigma_ann_garch if sigma_H_garch else None,
-            'atr': atr
+            'sigma_ann_har': sigma_ann_har if sigma_ann_har else None,
+            'sigma_ann_garch': sigma_ann_garch if sigma_ann_garch else None,
+            'atr': atr,
+            'sigmaH_blend_abs': sigmaH_blend_abs
         }
         
         # Print strategy results
@@ -422,9 +524,14 @@ if __name__ == "__main__":
             entry_price = live_price
             print(f"Live BTC price: ${entry_price:.2f}")
         
-        params = sl_tp_and_size(entry_price, sigma_H=sigma_H_har, k=1.2, m=2.2, side="long", R=200.0, 
+        # Use blended vol
+        cfg = load_settings()
+        atr_val = float(df["ATR20"].iloc[-1])
+        sigma_ann_garch, sigma_H_garch, garch_res = garch_sigma_ann_and_sigma_H(df["close"], interval="4h", horizon_hours=H_hours)
+        sigmaH_blend_abs = blended_sigma_h(sigma_ann_garch, sigma_ann_har, atr_abs=atr_val, price=entry_price, cfg=cfg)
+        params = sl_tp_and_size(entry_price, sigma_H=(sigmaH_blend_abs/entry_price), k=1.2, m=2.2, side="long", R=200.0, 
                                tick_size=market_info['tick_size'] if market_info else None)
-        print(f"Dynamic SL/TP: {params}")
+        print(f"Dynamic SL/TP (blended): {params}")
     
     # Multiple symbols analysis
     print("\n=== Multiple Symbols Analysis ===")
@@ -433,10 +540,10 @@ if __name__ == "__main__":
     
     # Summary table
     print("\n=== Summary Table ===")
-    print(f"{'Symbol':<12} {'Price':<10} {'HAR σ_ann':<10} {'ATR':<8} {'HAR SL':<8} {'HAR TP':<8}")
+    print(f"{'Symbol':<12} {'Price':<10} {'HAR σ_ann':<10} {'ATR':<8} {'Blend SL':<8} {'Blend TP':<8}")
     print("-" * 70)
     for symbol, data in results.items():
         har_sigma = f"{data['sigma_ann_har']:.1%}" if data['sigma_ann_har'] else "N/A"
-        har_sl = f"${data['strategies']['HAR_trend']['SL']:.0f}" if 'HAR_trend' in data['strategies'] else "N/A"
-        har_tp = f"${data['strategies']['HAR_trend']['TP']:.0f}" if 'HAR_trend' in data['strategies'] else "N/A"
-        print(f"{symbol:<12} ${data['entry_price']:<9.0f} {har_sigma:<10} {data['atr']:<7.0f} {har_sl:<8} {har_tp:<8}")
+        blend_sl = f"${data['strategies']['VOL_BLEND']['SL']:.0f}" if 'VOL_BLEND' in data['strategies'] else "N/A"
+        blend_tp = f"${data['strategies']['VOL_BLEND']['TP']:.0f}" if 'VOL_BLEND' in data['strategies'] else "N/A"
+        print(f"{symbol:<12} ${data['entry_price']:<9.0f} {har_sigma:<10} {data['atr']:<7.0f} {blend_sl:<8} {blend_tp:<8}")

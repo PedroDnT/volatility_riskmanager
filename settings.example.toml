@@ -6,3 +6,42 @@ api_secret = "YOUR_SECRET"
 [binance]
 api_key = "YOUR_KEY"
 api_secret = "YOUR_SECRET"
+
+[risk]
+base_target_pct = 0.025
+min_target_pct = 0.015
+max_target_pct = 0.040
+use_dynamic = true
+
+[stops]
+# baseline multipliers by leverage before regime multipliers
+k_sl_lev20 = 1.0
+k_sl_lev15 = 1.2
+k_sl_lev10 = 1.5
+k_sl_low   = 1.8
+
+m_tp_lev20 = 2.6
+m_tp_lev15 = 3.0
+m_tp_lev10 = 3.5
+m_tp_low   = 4.0
+
+atr_trail_mult_initial = 2.0
+atr_trail_mult_late    = 1.5
+
+scaleout_r1 = 1.5
+scaleout_r2 = 3.0
+scaleout_frac1 = 0.4
+scaleout_frac2 = 0.3
+leave_runner_frac = 0.3
+
+[vol]
+blend_w_garch = 0.30
+blend_w_har   = 0.40
+blend_w_atr   = 0.30
+garch_har_outlier_ratio = 2.0
+horizon_hours = 4
+
+[portfolio]
+corr_lookback_days = 60
+corr_threshold = 0.7
+cluster_risk_cap_pct = 0.5
