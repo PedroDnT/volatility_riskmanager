@@ -19,6 +19,13 @@ import datetime as dt
 from typing import Dict, List, Any, Optional
 import pandas as pd
 import numpy as np
+import ccxt
+from dotenv import load_dotenv
+
+try:
+    import tomllib
+except Exception:
+    tomllib = None
 
 try:
     import tomllib
@@ -55,6 +62,17 @@ def load_settings(path: str = "settings.toml") -> dict:
         except Exception:
             return {}
 
+def _hours_per_bar(timeframe: str) -> int:
+    try:
+        if timeframe.endswith('h'):
+            return int(timeframe[:-1])
+        if timeframe.endswith('d'):
+            return int(timeframe[:-1]) * 24
+    except Exception:
+        pass
+    # default to 4h if unknown
+    return 4
+
 class PositionRiskManager:
     """Manages risk analysis for all open positions."""
     
@@ -69,13 +87,30 @@ class PositionRiskManager:
         self.risk_analysis = {}
         self.cfg = load_settings()
         
+        # Centralized exchange object creation
+        load_dotenv()
+        api_key = os.getenv("BYBIT_API_KEY")
+        api_secret = os.getenv("BYBIT_API_SECRET")
+
+        if not api_key or not api_secret:
+            raise ValueError("BYBIT_API_KEY and BYBIT_API_SECRET must be set in .env file")
+
+        self.exchange = ccxt.bybit({
+            'apiKey': api_key,
+            'secret': api_secret,
+            'sandbox': self.sandbox,
+            'options': {
+                'defaultType': 'linear',
+            }
+        })
+
     def fetch_positions(self) -> List[Dict[str, Any]]:
         """Fetch current open positions."""
         print("=" * 80)
         print("Fetching current open positions...")
         print("=" * 80)
         
-        self.positions = fetch_bybit_positions()
+        self.positions = fetch_bybit_positions(self.exchange)
         
         if not self.positions:
             print("No open positions found.")
@@ -105,21 +140,37 @@ class PositionRiskManager:
         print(f"\nAnalyzing {symbol}...")
         
         # Get market info for tick size
-        market_info = get_bybit_market_info(symbol, sandbox=self.sandbox)
+        market_info = get_bybit_market_info(self.exchange, symbol)
         tick_size = market_info['tick_size'] if market_info else 0.00001
         
         # Fetch historical data
         try:
             df = get_klines_bybit(
+                self.exchange,
                 symbol=symbol,
                 timeframe=timeframe,
-                since=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=lookback_days),
-                sandbox=self.sandbox
+                since=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=lookback_days)
             )
             
             if df.empty:
                 print(f"  Warning: No historical data for {symbol}")
                 return self._get_default_risk_params(position)
+                
+            # Ensure enough bars for GARCH; if not, extend lookback and refetch just for GARCH fit
+            bar_hours = _hours_per_bar(timeframe)
+            required_days = int(math.ceil((500 * bar_hours) / 24.0) + 5)
+            if len(np.log(df["close"]).diff().dropna()) < 500 and lookback_days < required_days:
+                try:
+                    df_garch = get_klines_bybit(
+                        self.exchange,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        since=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=required_days)
+                    )
+                    if not df_garch.empty:
+                        df = df_garch
+                except Exception:
+                    pass
                 
         except Exception as e:
             print(f"  Error fetching data for {symbol}: {e}")
@@ -131,7 +182,7 @@ class PositionRiskManager:
         atr_pct = (atr / entry_price) * 100
         
         # Get current live price
-        live_price = get_live_price_bybit(symbol, sandbox=self.sandbox)
+        live_price = get_live_price_bybit(self.exchange, symbol)
         if live_price is None:
             live_price = float(df["close"].iloc[-1])
         
@@ -180,55 +231,142 @@ class PositionRiskManager:
         primary_sigma_frac = sigmaH_blend_abs / entry_price
         vol_method = "VOL_BLEND"
         
-        # Regime scoring (EMA crossover, Donchian breakout, ADX proxy)
+        # Enhanced confidence scoring with volatility analysis
         score = 0
+        confidence_factors = []
         try:
             close = df['close']
+            
+            # 1. Trend strength (EMA crossover)
             ema20 = close.ewm(span=20, adjust=False).mean()
             ema50 = close.ewm(span=50, adjust=False).mean()
-            if ema20.iloc[-1] > ema50.iloc[-1]:
+            if side == 'long' and ema20.iloc[-1] > ema50.iloc[-1]:
                 score += 1
+                confidence_factors.append("Uptrend (EMA20 > EMA50)")
+            elif side == 'short' and ema20.iloc[-1] < ema50.iloc[-1]:
+                score += 1
+                confidence_factors.append("Downtrend (EMA20 < EMA50)")
+            
+            # 2. Breakout confirmation (Donchian channels)
             donch_high = df['high'].rolling(window=20, min_periods=20).max()
             donch_low  = df['low'].rolling(window=20, min_periods=20).min()
             if side == 'long' and close.iloc[-1] > donch_high.iloc[-2]:
                 score += 1
-            if side == 'short' and close.iloc[-1] < donch_low.iloc[-2]:
+                confidence_factors.append("Breakout above Donchian high")
+            elif side == 'short' and close.iloc[-1] < donch_low.iloc[-2]:
                 score += 1
-            # ADX proxy: use rolling std of returns as trend strength proxy
+                confidence_factors.append("Breakout below Donchian low")
+            
+            # 3. Volatility regime analysis
             rets = np.log(close).diff()
-            adx_proxy = rets.rolling(window=14).std()
-            if float(adx_proxy.iloc[-1]) > float(adx_proxy.rolling(100).median().iloc[-1]):
+            vol_20 = rets.rolling(window=20).std()
+            vol_100 = rets.rolling(window=100).std()
+            current_vol = float(vol_20.iloc[-1])
+            avg_vol = float(vol_100.median())
+            
+            # Low volatility = higher confidence (less noise)
+            if current_vol < avg_vol * 0.8:
                 score += 1
-        except Exception:
-            pass
+                confidence_factors.append("Low volatility regime")
+            elif current_vol > avg_vol * 1.5:
+                score -= 1  # High volatility reduces confidence
+                confidence_factors.append("High volatility regime")
+            
+            # 4. Price momentum (RSI proxy)
+            rsi_period = 14
+            gains = close.diff().where(close.diff() > 0, 0)
+            losses = -close.diff().where(close.diff() < 0, 0)
+            avg_gain = gains.rolling(window=rsi_period).mean()
+            avg_loss = losses.rolling(window=rsi_period).mean()
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+            
+            if side == 'long' and rsi.iloc[-1] > 50:
+                score += 1
+                confidence_factors.append("Positive momentum (RSI > 50)")
+            elif side == 'short' and rsi.iloc[-1] < 50:
+                score += 1
+                confidence_factors.append("Negative momentum (RSI < 50)")
+            
+            # 5. Volatility stability (GARCH validation)
+            if volatility_metrics.get('garch_sigma_ann') and volatility_metrics.get('har_sigma_ann'):
+                garch_har_ratio = volatility_metrics['garch_sigma_ann'] / volatility_metrics['har_sigma_ann']
+                if 0.5 <= garch_har_ratio <= 2.0:  # Models agree
+                    score += 1
+                    confidence_factors.append("Volatility models aligned")
+                elif garch_har_ratio > 3.0:  # High disagreement
+                    score -= 1
+                    confidence_factors.append("Volatility models disagree")
+            
+        except Exception as e:
+            print(f"  Confidence scoring error: {e}")
         
-        # Dynamic risk target pct
+        # Clamp score to reasonable range
+        score = max(-2, min(5, score))
+        
+        # Enhanced dynamic risk management (2-3% based on confidence/volatility)
         risk_cfg = self.cfg.get('risk', {})
-        base_pct = float(risk_cfg.get('base_target_pct', 0.02))
-        min_p   = float(risk_cfg.get('min_target_pct', 0.015))
-        max_p   = float(risk_cfg.get('max_target_pct', 0.04))
+        base_pct = float(risk_cfg.get('base_target_pct', 0.025))  # 2.5% base
+        min_p   = float(risk_cfg.get('min_target_pct', 0.02))     # 2% minimum
+        max_p   = float(risk_cfg.get('max_target_pct', 0.03))     # 3% maximum
         use_dyn = bool(risk_cfg.get('use_dynamic', True))
-        mult_map = {0:0.8, 1:1.0, 2:1.2, 3:1.4}
-        risk_target_pct = base_pct * (mult_map.get(score, 1.0) if use_dyn else 1.0)
+        
+        # Professional risk scaling based on confidence score
+        if use_dyn:
+            if score >= 4:  # High confidence
+                risk_mult = 1.2  # 3% risk
+            elif score >= 2:  # Medium confidence
+                risk_mult = 1.0  # 2.5% risk
+            elif score >= 0:  # Low confidence
+                risk_mult = 0.9  # 2.25% risk
+            else:  # Negative confidence
+                risk_mult = 0.8  # 2% risk
+        else:
+            risk_mult = 1.0
+        
+        risk_target_pct = base_pct * risk_mult
         risk_target_pct = float(np.clip(risk_target_pct, min_p, max_p))
         
-        # Baseline k/m by leverage + regime multiplier
+        # Professional stop-loss and take-profit levels (2-4× ATR)
         stops_cfg = self.cfg.get('stops', {})
-        if leverage >= 20:
-            k_sl_base = float(stops_cfg.get('k_sl_lev20', 1.0))
-            m_tp_base = float(stops_cfg.get('m_tp_lev20', 2.6))
-        elif leverage >= 15:
-            k_sl_base = float(stops_cfg.get('k_sl_lev15', 1.2))
-            m_tp_base = float(stops_cfg.get('m_tp_lev15', 3.0))
-        elif leverage >= 10:
-            k_sl_base = float(stops_cfg.get('k_sl_lev10', 1.5))
-            m_tp_base = float(stops_cfg.get('m_tp_lev10', 3.5))
-        else:
-            k_sl_base = float(stops_cfg.get('k_sl_low', 1.8))
-            m_tp_base = float(stops_cfg.get('m_tp_low', 4.0))
-        k_sl_eff = k_sl_base * (1.0 + 0.1*score)
-        m_tp_eff = m_tp_base * (1.0 + 0.2*score)
         
+        # Base multipliers by leverage (professional standards)
+        if leverage >= 20:
+            k_sl_base = float(stops_cfg.get('k_sl_lev20', 1.5))  # Increased from 1.0
+            m_tp_base = float(stops_cfg.get('m_tp_lev20', 3.0))  # Increased from 2.6
+        elif leverage >= 15:
+            k_sl_base = float(stops_cfg.get('k_sl_lev15', 1.8))  # Increased from 1.2
+            m_tp_base = float(stops_cfg.get('m_tp_lev15', 3.5))  # Increased from 3.0
+        elif leverage >= 10:
+            k_sl_base = float(stops_cfg.get('k_sl_lev10', 2.2))  # Increased from 1.5
+            m_tp_base = float(stops_cfg.get('m_tp_lev10', 4.0))  # Increased from 3.5
+        else:
+            k_sl_base = float(stops_cfg.get('k_sl_low', 2.5))    # Increased from 1.8
+            m_tp_base = float(stops_cfg.get('m_tp_low', 4.5))    # Increased from 4.0
+        
+        # Volatility-based adjustments
+        atr_pct = (atr / entry_price) * 100
+        vol_adjustment = 1.0
+        
+        # Adjust for extreme volatility (wider stops in high vol)
+        if atr_pct > 5.0:  # Very high volatility
+            vol_adjustment = 1.3
+        elif atr_pct > 3.0:  # High volatility
+            vol_adjustment = 1.15
+        elif atr_pct < 1.0:  # Low volatility
+            vol_adjustment = 0.9
+        
+        # Confidence-based adjustments
+        confidence_adjustment = 1.0 + (score * 0.05)  # ±25% based on confidence
+        
+        # Apply adjustments
+        k_sl_eff = k_sl_base * vol_adjustment * confidence_adjustment
+        m_tp_eff = m_tp_base * vol_adjustment * confidence_adjustment
+        
+        # Ensure minimum professional standards
+        k_sl_eff = max(k_sl_eff, 1.5)  # Minimum 1.5× ATR for stops
+        m_tp_eff = max(m_tp_eff, 2.5)  # Minimum 2.5× ATR for targets
+ 
         # Calculate SL/TP levels with optimal position sizing
         target_risk_dollars = position['notional'] * risk_target_pct
         risk_params = sl_tp_and_size(
@@ -348,7 +486,10 @@ class PositionRiskManager:
             'leave_runner_frac': frac_runner,
             'trail_stop_suggestion': trail_suggestion,
             'regime_score': score,
+            'confidence_factors': confidence_factors,
             'risk_target_pct': risk_target_pct,
+            'volatility_adjustment': vol_adjustment,
+            'confidence_adjustment': confidence_adjustment,
             
             # Risk metrics
             'dollar_risk': dollar_risk,
@@ -456,7 +597,7 @@ class PositionRiskManager:
         for pos in self.positions:
             sym = pos['symbol']
             try:
-                df = get_klines_bybit(sym, timeframe='4h', since=dt.datetime.utcnow() - dt.timedelta(days=lookback_days), sandbox=self.sandbox)
+                df = get_klines_bybit(self.exchange, sym, timeframe='4h', since=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=lookback_days))
                 if not df.empty:
                     symbol_to_returns[sym] = np.log(df['close']).diff().dropna()
             except Exception:
@@ -593,11 +734,19 @@ class PositionRiskManager:
             report.append(f"    • Close {analysis['scaleout_frac2']*100:.0f}% @ {analysis['tp2']:.6f}")
             report.append(f"    • Leave {analysis['leave_runner_frac']*100:.0f}% runner; Trail suggestion: {analysis['trail_stop_suggestion']:.6f}")
 
-            # Regime and risk target
-            report.append("  Regime/Risk:")
-            report.append(f"    Regime score: {analysis['regime_score']}")
-            report.append(f"    Risk target: {analysis['risk_target_pct']*100:.2f}% of notional")
-            report.append(f"    k_sl: {analysis['k_multiplier']:.2f}, m_tp: {analysis['m_multiplier']:.2f}")
+            # Professional confidence analysis
+            report.append("  Professional Analysis:")
+            report.append(f"    Confidence Score: {analysis['regime_score']}/5")
+            if analysis.get('confidence_factors'):
+                report.append(f"    Confidence Factors: {', '.join(analysis['confidence_factors'])}")
+            report.append(f"    Volatility Adjustment: {analysis.get('volatility_adjustment', 1.0):.2f}x")
+            report.append(f"    Confidence Adjustment: {analysis.get('confidence_adjustment', 1.0):.2f}x")
+            
+            # Risk management details
+            report.append("  Risk Management:")
+            report.append(f"    Risk Target: {analysis['risk_target_pct']*100:.2f}% of notional")
+            report.append(f"    Stop Loss: {analysis['k_multiplier']:.2f}× ATR (Professional: 2-4×)")
+            report.append(f"    Take Profit: {analysis['m_multiplier']:.2f}× ATR (Professional: 2.5-4.5×)")
 
             # Portfolio cap note if present
             if analysis.get('portfolio_note'):

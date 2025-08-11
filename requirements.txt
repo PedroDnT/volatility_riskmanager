@@ -3,3 +3,4 @@ pandas>=2.2.2
 numpy>=1.26.4
 python-dotenv>=1.0.0
 arch>=5.0.0
+pytest>=8.2.2

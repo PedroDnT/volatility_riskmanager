@@ -8,22 +8,23 @@ api_key = "YOUR_KEY"
 api_secret = "YOUR_SECRET"
 
 [risk]
-base_target_pct = 0.025
-min_target_pct = 0.015
-max_target_pct = 0.040
-use_dynamic = true
+base_target_pct = 0.025  # 2.5% base risk target
+min_target_pct = 0.020   # 2% minimum (professional minimum)
+max_target_pct = 0.030   # 3% maximum (professional maximum)
+use_dynamic = true       # Enable dynamic risk based on confidence
 
 [stops]
-# baseline multipliers by leverage before regime multipliers
-k_sl_lev20 = 1.0
-k_sl_lev15 = 1.2
-k_sl_lev10 = 1.5
-k_sl_low   = 1.8
+# Professional stop-loss multipliers (2-4× ATR to avoid random swings)
+k_sl_lev20 = 1.5  # High leverage: tighter stops but still professional
+k_sl_lev15 = 1.8  # Medium-high leverage
+k_sl_lev10 = 2.2  # Medium leverage
+k_sl_low   = 2.5  # Low leverage: wider stops for better R:R
 
-m_tp_lev20 = 2.6
-m_tp_lev15 = 3.0
-m_tp_lev10 = 3.5
-m_tp_low   = 4.0
+# Professional take-profit multipliers (2.5-4.5× ATR for better expectancy)
+m_tp_lev20 = 3.0  # High leverage: conservative targets
+m_tp_lev15 = 3.5  # Medium-high leverage
+m_tp_lev10 = 4.0  # Medium leverage
+m_tp_low   = 4.5  # Low leverage: aggressive targets
 
 atr_trail_mult_initial = 2.0
 atr_trail_mult_late    = 1.5

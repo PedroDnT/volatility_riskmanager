@@ -31,25 +31,12 @@ def load_settings(path: str = "settings.toml") -> dict:
 
 # ---------- CCXT Bybit Data Fetcher ----------
 
-def get_live_price_bybit(symbol="BTC/USDT", sandbox=False):
+def get_live_price_bybit(exchange: ccxt.Exchange, symbol="BTC/USDT"):
     """
     Get real-time live price from Bybit using ticker endpoint.
     
     Returns: float with current live price
     """
-    import os
-    from dotenv import load_dotenv
-    load_dotenv()
-    
-    # Initialize Bybit exchange
-    exchange = ccxt.bybit({
-        'sandbox': sandbox,  # Set to True for testnet
-        'enableRateLimit': True,
-        # Add API credentials if needed for private endpoints
-        'apiKey': os.getenv('BYBIT_API_KEY'),
-        'secret': os.getenv('BYBIT_API_SECRET'),
-    })
-    
     try:
         # Fetch current ticker for live price
         ticker = exchange.fetch_ticker(symbol)
@@ -60,31 +47,18 @@ def get_live_price_bybit(symbol="BTC/USDT", sandbox=False):
         print(f"Error fetching live price from Bybit: {e}")
         return None
 
-def get_klines_bybit(symbol="BTC/USDT", timeframe="4h", since=None, limit=1000, sandbox=False):
+def get_klines_bybit(exchange: ccxt.Exchange, symbol="BTC/USDT", timeframe="4h", since=None, limit=1000):
     """
     Fetch OHLCV data from Bybit using ccxt.
     
+    exchange: An initialized ccxt.Exchange object
     symbol: ccxt format like "BTC/USDT", "ETH/USDT"
     timeframe: ccxt format like "1m", "5m", "15m", "1h", "4h", "1d"
     since: datetime object or timestamp in ms, or None for recent data
     limit: max number of candles (Bybit max ~1000 per request)
-    sandbox: True to use testnet
     
     Returns: DataFrame with time-indexed OHLCV
     """
-    import os
-    from dotenv import load_dotenv
-    load_dotenv()
-    
-    # Initialize Bybit exchange
-    exchange = ccxt.bybit({
-        'sandbox': sandbox,  # Set to True for testnet
-        'enableRateLimit': True,
-        # Add API credentials if needed for private endpoints
-        'apiKey': os.getenv('BYBIT_API_KEY'),
-        'secret': os.getenv('BYBIT_API_SECRET'),
-    })
-    
     # Convert datetime to timestamp if needed
     if isinstance(since, dt.datetime):
         since = int(since.timestamp() * 1000)
@@ -114,19 +88,19 @@ def get_klines_bybit(symbol="BTC/USDT", timeframe="4h", since=None, limit=1000, 
         print(f"Error fetching data from Bybit: {e}")
         return pd.DataFrame()
 
-def get_multiple_timeframes_bybit(symbol="BTC/USDT", timeframes=["4h"], days_back=120, sandbox=False):
+def get_multiple_timeframes_bybit(exchange: ccxt.Exchange, symbol="BTC/USDT", timeframes=["4h"], days_back=120):
     """
     Fetch multiple timeframes for the same symbol from Bybit.
     
     Returns: dict with timeframe as key, DataFrame as value
     """
-    end_time = dt.datetime.utcnow()
+    end_time = dt.datetime.now(dt.timezone.utc)
     start_time = end_time - dt.timedelta(days=days_back)
     
     data = {}
     for tf in timeframes:
         print(f"Fetching {symbol} {tf} data from Bybit...")
-        df = get_klines_bybit(symbol, tf, since=start_time, limit=1000, sandbox=sandbox)
+        df = get_klines_bybit(exchange, symbol, tf, since=start_time, limit=1000)
         if not df.empty:
             data[tf] = df
         time.sleep(0.1)  # Rate limiting
@@ -135,15 +109,10 @@ def get_multiple_timeframes_bybit(symbol="BTC/USDT", timeframes=["4h"], days_bac
 
 # ---------- Enhanced Bybit Market Info ----------
 
-def get_bybit_market_info(symbol="BTC/USDT", sandbox=False):
+def get_bybit_market_info(exchange: ccxt.Exchange, symbol="BTC/USDT"):
     """
     Get market information like tick size, min quantity, etc. from Bybit
     """
-    exchange = ccxt.bybit({
-        'sandbox': sandbox,
-        'enableRateLimit': True,
-    })
-    
     try:
         markets = exchange.load_markets()
         if symbol in markets:
@@ -407,7 +376,7 @@ def compute_trailing_stop(entry: float, direction: str, atr: float, cfg: dict, r
 
 # ---------- Enhanced example with multiple symbols ----------
 
-def analyze_multiple_symbols_bybit(symbols=["BTC/USDT", "ETH/USDT"], timeframe="4h", days_back=120, sandbox=False):
+def analyze_multiple_symbols_bybit(exchange: ccxt.Exchange, symbols=["BTC/USDT", "ETH/USDT"], timeframe="4h", days_back=120):
     """
     Analyze multiple symbols from Bybit with volatility forecasts and SL/TP calculations.
     """
@@ -417,13 +386,12 @@ def analyze_multiple_symbols_bybit(symbols=["BTC/USDT", "ETH/USDT"], timeframe="
         print(f"\n=== Analyzing {symbol} ===")
         
         # Get market info
-        market_info = get_bybit_market_info(symbol, sandbox=sandbox)
+        market_info = get_bybit_market_info(exchange, symbol)
         tick_size = market_info['tick_size'] if market_info else None
         
         # Get data
-        df = get_klines_bybit(symbol, timeframe, 
-                             since=dt.datetime.utcnow() - dt.timedelta(days=days_back),
-                             sandbox=sandbox)
+        df = get_klines_bybit(exchange, symbol, timeframe,
+                             since=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days_back))
         
         if df.empty:
             print(f"No data for {symbol}")
@@ -455,7 +423,7 @@ def analyze_multiple_symbols_bybit(symbols=["BTC/USDT", "ETH/USDT"], timeframe="
             sigma_ann_garch, sigma_H_garch = None, None
         
         # Get live price for current analysis
-        live_price = get_live_price_bybit(symbol, sandbox=sandbox)
+        live_price = get_live_price_bybit(exchange, symbol)
         if live_price is None:
             print(f"Warning: Could not get live price for {symbol}, using last close price")
             entry_price = float(df["close"].iloc[-1])
@@ -493,20 +461,30 @@ def analyze_multiple_symbols_bybit(symbols=["BTC/USDT", "ETH/USDT"], timeframe="
 # ---------- Example usage ----------
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()
+
     # Set to True to use Bybit testnet
     USE_SANDBOX = False
     
+    # For standalone execution, create an exchange instance
+    exchange = ccxt.bybit({
+        'sandbox': USE_SANDBOX,
+        'enableRateLimit': True,
+        'apiKey': os.getenv('BYBIT_API_KEY'),
+        'secret': os.getenv('BYBIT_API_SECRET'),
+    })
+
     # Single symbol analysis
     print("=== Single Symbol Analysis (BTC/USDT) ===")
-    df = get_klines_bybit("BTC/USDT", "4h", 
-                         since=dt.datetime.utcnow() - dt.timedelta(days=120),
-                         sandbox=USE_SANDBOX)
+    df = get_klines_bybit(exchange, "BTC/USDT", "4h",
+                         since=dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=120))
     
     if not df.empty:
         print(f"Downloaded {len(df)} candles, latest close: ${df['close'].iloc[-1]:.2f}")
         
         # Get market info
-        market_info = get_bybit_market_info("BTC/USDT", sandbox=USE_SANDBOX)
+        market_info = get_bybit_market_info(exchange, "BTC/USDT")
         if market_info:
             print(f"Tick size: {market_info['tick_size']}, Min quantity: {market_info['min_quantity']}")
         
@@ -516,7 +494,7 @@ if __name__ == "__main__":
         sigma_ann_har, sigma_H_har = sigma_ann_and_sigma_H_from_har(df["close"], interval="4h", horizon_hours=H_hours)
         
         # Get live price for current analysis
-        live_price = get_live_price_bybit("BTC/USDT", sandbox=USE_SANDBOX)
+        live_price = get_live_price_bybit(exchange, "BTC/USDT")
         if live_price is None:
             print(f"Warning: Could not get live price, using last close price")
             entry_price = float(df["close"].iloc[-1])
@@ -536,7 +514,7 @@ if __name__ == "__main__":
     # Multiple symbols analysis
     print("\n=== Multiple Symbols Analysis ===")
     symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-    results = analyze_multiple_symbols_bybit(symbols, timeframe="4h", days_back=90, sandbox=USE_SANDBOX)
+    results = analyze_multiple_symbols_bybit(exchange, symbols, timeframe="4h", days_back=90)
     
     # Summary table
     print("\n=== Summary Table ===")

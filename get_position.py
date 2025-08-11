@@ -34,36 +34,13 @@ except ImportError as exc:
     ) from exc
 
 
-def fetch_bybit_positions() -> List[Dict[str, Any]]:
+def fetch_bybit_positions(exchange: ccxt.Exchange) -> List[Dict[str, Any]]:
     """Fetch current derivatives positions from Bybit.
     
     Returns a list of position dictionaries, or an empty list if
     API credentials are missing or there's an error.
     """
-    # Load environment variables from .env file
-    load_dotenv()
-    
-    api_key = os.getenv("BYBIT_API_KEY")
-    api_secret = os.getenv("BYBIT_API_SECRET")
-    
-    if not api_key or not api_secret:
-        print("Error: BYBIT_API_KEY or BYBIT_API_SECRET not found in .env file.")
-        print("Please create a .env file with these variables:")
-        print("BYBIT_API_KEY=your_api_key_here")
-        print("BYBIT_API_SECRET=your_api_secret_here")
-        return []
-    
     try:
-        # Create authenticated Bybit exchange instance
-        exchange = ccxt.bybit({
-            'apiKey': api_key,
-            'secret': api_secret,
-            'sandbox': False,  # Set to True for testnet
-            'options': {
-                'defaultType': 'linear',  # For USDT perpetual contracts
-            }
-        })
-        
         # Fetch positions
         positions = exchange.fetch_positions()
         
@@ -105,31 +82,12 @@ def fetch_bybit_positions() -> List[Dict[str, Any]]:
         return []
 
 
-def fetch_bybit_account_balance() -> Dict[str, Any]:
+def fetch_bybit_account_balance(exchange: ccxt.Exchange) -> Dict[str, Any]:
     """Fetch account balance information from Bybit.
     
     Returns a dictionary with account balance details.
     """
-    # Load environment variables from .env file
-    load_dotenv()
-    
-    api_key = os.getenv("BYBIT_API_KEY")
-    api_secret = os.getenv("BYBIT_API_SECRET")
-    
-    if not api_key or not api_secret:
-        return {}
-    
     try:
-        # Create authenticated Bybit exchange instance
-        exchange = ccxt.bybit({
-            'apiKey': api_key,
-            'secret': api_secret,
-            'sandbox': False,  # Set to True for testnet
-            'options': {
-                'defaultType': 'linear',  # For USDT perpetual contracts
-            }
-        })
-        
         # Fetch account balance
         balance = exchange.fetch_balance()
         
@@ -157,13 +115,36 @@ def fetch_bybit_account_balance() -> Dict[str, Any]:
 
 def main() -> None:
     """Main routine for fetching Bybit positions."""
+    # Load environment variables from .env file
+    load_dotenv()
+
+    api_key = os.getenv("BYBIT_API_KEY")
+    api_secret = os.getenv("BYBIT_API_SECRET")
+
+    if not api_key or not api_secret:
+        print("Error: BYBIT_API_KEY or BYBIT_API_SECRET not found in .env file.")
+        print("Please create a .env file with these variables:")
+        print("BYBIT_API_KEY=your_api_key_here")
+        print("BYBIT_API_SECRET=your_api_secret_here")
+        return
+
+    # For standalone execution, create an exchange instance
+    exchange = ccxt.bybit({
+        'apiKey': api_key,
+        'secret': api_secret,
+        'sandbox': False,  # Set to True for testnet
+        'options': {
+            'defaultType': 'linear',  # For USDT perpetual contracts
+        }
+    })
+
     print("Fetching open positions from Bybit...")
     
     # Fetch current Bybit positions
-    positions = fetch_bybit_positions()
+    positions = fetch_bybit_positions(exchange)
     
     # Fetch account balance information
-    account_balance = fetch_bybit_account_balance()
+    account_balance = fetch_bybit_account_balance(exchange)
     
     # Display account summary
     if account_balance:

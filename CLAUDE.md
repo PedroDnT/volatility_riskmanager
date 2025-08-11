@@ -18,12 +18,11 @@ The project requires the following Python packages:
 - `pandas>=2.2.2` - for data manipulation and time series analysis
 - `numpy>=1.26.4` - for numerical computations
 - `python-dotenv>=1.0.0` - for environment variable management
-- `arch` - for GARCH volatility modeling (not in requirements.txt, install separately)
+- `arch>=5.0.0` - for GARCH volatility modeling
 
 Install dependencies with:
 ```bash
 pip install -r requirements.txt
-pip install arch  # For GARCH models
 ```
 
 ## Environment Variables
