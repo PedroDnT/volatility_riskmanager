@@ -14,13 +14,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.x' # Adjust based on your project's Python version
+          python-version: '3.12'Adjust based on your project's Python version
 
       - name: Set up virtual environment
         run: |
           python -m venv venv
           source venv/bin/activate
-          pip install -e .
+          pip install -r requirements.txt
+
 
       - name: Configure settings and environment
         run: |
@@ -34,4 +35,4 @@ jobs:
           BYBIT_API_SECRET: ${{ secrets.BYBIT_API_SECRET }}
         run: |
           source venv/bin/activate
-          risk-manager
+          python risk-manager.py
