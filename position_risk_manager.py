@@ -22,6 +22,9 @@ import numpy as np
 import ccxt
 from dotenv import load_dotenv
 
+# New: typing imports
+from dataclasses import dataclass
+
 try:
     import tomllib
 except Exception:
@@ -81,6 +84,12 @@ class PositionRiskManager:
         self.positions = []
         self.risk_analysis = {}
         self.cfg = load_settings()
+        # Defaults for new features
+        self._risk_freeze_cfg = self.cfg.get('risk_freeze', {}) if isinstance(self.cfg, dict) else {}
+        self._target_leverage_default = float(self._risk_freeze_cfg.get('target_leverage', 8.0))
+        self._funding_daily_alert_threshold = float(self._risk_freeze_cfg.get('funding_daily_alert_threshold', 0.002))  # 0.20%/day
+        self._time_stop_bars = int(self._risk_freeze_cfg.get('time_stop_bars', 24))  # e.g., 24 bars on 4h
+        self._portfolio_beta_target_reduction = float(self._risk_freeze_cfg.get('portfolio_beta_target_reduction', 0.4))
         
         # Centralized exchange object creation
         load_dotenv()
@@ -99,6 +108,100 @@ class PositionRiskManager:
             }
         })
 
+    # --- New helpers for minimal additions ---
+    def _approx_liq_price(self, entry: float, side: str, leverage: float, maint_margin_frac: float = 0.005) -> Optional[float]:
+        try:
+            if leverage is None or leverage <= 0:
+                return None
+            if side.lower() == 'long':
+                # Simplified Bybit linear approx
+                return entry * (1 - 1.0 / leverage) * (1 - maint_margin_frac)
+            else:
+                return entry * (1 + 1.0 / leverage) * (1 + maint_margin_frac)
+        except Exception:
+            return None
+
+    def _delta_margin_needed(self, notional: float, leverage: Optional[float], initial_margin: Optional[float], target_leverage: float) -> Dict[str, float]:
+        # Equity attached approximation: prefer initialMargin; else notional/leverage
+        equity_attached = None
+        if isinstance(initial_margin, (int, float)) and initial_margin is not None:
+            try:
+                equity_attached = float(initial_margin)
+            except Exception:
+                equity_attached = None
+        if equity_attached is None and leverage and leverage > 0:
+            equity_attached = float(notional) / float(leverage)
+        if equity_attached is None or equity_attached <= 0:
+            return {
+                'equity_attached': 0.0,
+                'current_leverage': float('nan'),
+                'target_leverage': target_leverage,
+                'delta_margin_needed': float('nan')
+            }
+        current_lev = float(notional) / float(equity_attached) if equity_attached else float('nan')
+        target_equity = float(notional) / float(max(target_leverage, 1e-9))
+        delta_margin = max(0.0, target_equity - equity_attached)
+        return {
+            'equity_attached': float(equity_attached),
+            'current_leverage': float(current_lev),
+            'target_leverage': float(target_leverage),
+            'delta_margin_needed': float(delta_margin),
+        }
+
+    def _estimate_funding_daily_cost(self, symbol: str, notional: float) -> Dict[str, float]:
+        funding_rate_8h = None
+        try:
+            fr = self.exchange.fetch_funding_rate(symbol)
+            # ccxt returns rate for the next/last period as decimal (e.g., 0.0001 for 0.01%)
+            funding_rate_8h = float(fr.get('fundingRate') or fr.get('info', {}).get('funding_rate'))
+        except Exception:
+            # Try multiple fetch if supported
+            try:
+                all_rates = self.exchange.fetch_funding_rates([symbol])
+                if symbol in all_rates and all_rates[symbol].get('fundingRate') is not None:
+                    funding_rate_8h = float(all_rates[symbol]['fundingRate'])
+            except Exception:
+                funding_rate_8h = None
+        if funding_rate_8h is None:
+            return {
+                'funding_rate_8h': float('nan'),
+                'funding_rate_daily': float('nan'),
+                'est_daily_funding_cost': float('nan'),
+                'funding_alert': False,
+            }
+        rate_daily = funding_rate_8h * 3.0
+        est_cost = abs(rate_daily) * float(notional)
+        alert = abs(rate_daily) >= self._funding_daily_alert_threshold
+        return {
+            'funding_rate_8h': float(funding_rate_8h),
+            'funding_rate_daily': float(rate_daily),
+            'est_daily_funding_cost': float(est_cost),
+            'funding_alert': bool(alert),
+        }
+
+    def _time_stop_counters(self, df: pd.DataFrame, entry_price: float, side: str) -> Dict[str, int | bool]:
+        # Count consecutive bars currently below (long) or above (short) entry
+        closes = df['close']
+        streak = 0
+        if side == 'long':
+            for v in reversed(closes.tolist()):
+                if v < entry_price:
+                    streak += 1
+                else:
+                    break
+        else:
+            for v in reversed(closes.tolist()):
+                if v > entry_price:
+                    streak += 1
+                else:
+                    break
+        time_stop_hit = streak >= self._time_stop_bars
+        return {
+            'bars_underwater_streak': int(streak),
+            'time_stop_bars': int(self._time_stop_bars),
+            'time_stop_hit': bool(time_stop_hit),
+        }
+    
     def fetch_positions(self) -> List[Dict[str, Any]]:
         """Fetch current open positions."""
         print("=" * 80)
@@ -180,6 +283,8 @@ class PositionRiskManager:
         live_price = get_live_price_bybit(self.exchange, symbol)
         if live_price is None:
             live_price = float(df["close"].iloc[-1])
+        # Compute time-stop counters (bars below/above entry)
+        ts = self._time_stop_counters(df, entry_price=entry_price, side=side)
         
         # Calculate volatility using multiple methods
         volatility_metrics: Dict[str, Optional[float]] = {}
@@ -210,10 +315,6 @@ class PositionRiskManager:
                 print("  GARCH checks:", "; ".join(issues))
             volatility_metrics['garch_sigma_ann'] = sigma_ann_garch if garch_ok else None
             volatility_metrics['garch_sigma_H'] = sigma_H_garch if garch_ok else None
-        except Exception as e:
-            print(f"  GARCH failed: {e}")
-            volatility_metrics['garch_sigma_ann'] = None
-            volatility_metrics['garch_sigma_H'] = None
         
         # Blend vols in absolute horizon units
         sigmaH_blend_abs = blended_sigma_h(
@@ -387,6 +488,20 @@ class PositionRiskManager:
         else:
             tp1 = entry_price - scale_r1 * R_unit
             tp2 = entry_price - scale_r2 * R_unit
+        # New: Reduce-only ladder (entry, entry+0.5R, TP1)
+        if side == 'long':
+            ladder_p1 = entry_price
+            ladder_p2 = entry_price + 0.5 * R_unit
+            ladder_p3 = tp1
+        else:
+            ladder_p1 = entry_price
+            ladder_p2 = entry_price - 0.5 * R_unit
+            ladder_p3 = tp1
+        ladder_sizes = {
+            'p1_frac': 0.40,
+            'p2_frac': 0.30,
+            'p3_frac': 0.30,
+        }
         
         # Trailing stop suggestion (assume unrealized R from current price)
         if side == 'long':
@@ -417,6 +532,19 @@ class PositionRiskManager:
         # Calculate dollar risk and reward using OPTIMAL position size
         optimal_position_size = risk_params['Q']
         current_position_size = position['size']
+        # New: Oversize ratio and Risk-Freeze trigger
+        oversize_ratio = (current_position_size / optimal_position_size) if optimal_position_size else float('inf')
+        risk_freeze_required = bool((oversize_ratio > 1.5) or (liq_buffer_ratio is not None and (liq_buffer_ratio < 3.0)))
+        # New: ΔMargin calculator
+        target_lev = float(self._target_leverage_default)
+        dm = self._delta_margin_needed(
+            notional=position['notional'],
+            leverage=leverage,
+            initial_margin=position.get('initialMargin'),
+            target_leverage=target_lev,
+        )
+        # New: Funding bleed estimate
+        funding = self._estimate_funding_daily_cost(symbol=symbol, notional=position['notional'])
         
         if side == 'long':
             optimal_dollar_risk = optimal_position_size * (entry_price - risk_params['SL'])
@@ -473,7 +601,7 @@ class PositionRiskManager:
             'k_multiplier': k_sl_eff,
             'm_multiplier': m_tp_eff,
             
-            # Scale-outs
+            # Scale-outs (existing)
             'tp1': tp1,
             'tp2': tp2,
             'scaleout_frac1': frac1,
@@ -494,6 +622,21 @@ class PositionRiskManager:
             'risk_reward_ratio': rr_ratio,
             'liquidation_buffer_safe': liq_buffer_safe,
             'liquidation_buffer_ratio': liq_buffer_ratio,
+
+            # New: Risk-Freeze block
+            'oversize_ratio': oversize_ratio,
+            'risk_freeze_required': risk_freeze_required,
+            'delta_margin': dm,
+            'reduce_only_ladder': {
+                'p1_price': ladder_p1,
+                'p2_price': ladder_p2,
+                'p3_price': ladder_p3,
+                'p1_frac': ladder_sizes['p1_frac'],
+                'p2_frac': ladder_sizes['p2_frac'],
+                'p3_frac': ladder_sizes['p3_frac'],
+            },
+            'time_stop': ts,
+            'funding': funding,
         }
     
     def _get_default_risk_params(self, position: Dict[str, Any]) -> Dict[str, Any]:
@@ -642,6 +785,37 @@ class PositionRiskManager:
                     analysis['dollar_reward'] *= scale
                     analysis['portfolio_note'] = f"Cluster {cluster} risk capped {cluster_risk:.2f}→{max_cluster_risk:.2f} (ρ≥{corr_threshold})"
  
+        # After cluster capping, compute beta reducer recommendation
+        try:
+            if len(symbol_to_returns) >= 2:
+                rets_df = pd.DataFrame(symbol_to_returns).dropna(how='any')
+                if not rets_df.empty:
+                    port_ret = rets_df.mean(axis=1)
+                    corr_to_port = rets_df.apply(lambda s: s.corr(port_ret))
+                    # Build recommendation list for trimming
+                    candidates = []
+                    for pos in self.positions:
+                        sym = pos['symbol']
+                        gain_pct = max(float(pos.get('percentage') or 0.0), 0.0)
+                        corr_val = float(corr_to_port.get(sym, np.nan))
+                        if np.isnan(corr_val):
+                            continue
+                        score = gain_pct * max(corr_val, 0.0) * (float(pos.get('notional') or 0.0))
+                        candidates.append({
+                            'symbol': sym,
+                            'corr_to_portfolio': corr_val,
+                            'unrealized_gain_pct': gain_pct,
+                            'notional': float(pos.get('notional') or 0.0),
+                            'score': score,
+                        })
+                    candidates.sort(key=lambda x: x['score'], reverse=True)
+                    self.risk_analysis['portfolio_beta_reducer'] = {
+                        'target_reduction': self._portfolio_beta_target_reduction,
+                        'candidates': candidates[:10],
+                    }
+        except Exception:
+            pass
+
     def generate_report(self) -> str:
         """Generate comprehensive risk management report."""
         if not self.risk_analysis:
@@ -785,6 +959,39 @@ class PositionRiskManager:
         report.append("  2. Monitor high-leverage positions (15x+) closely")
         report.append("  3. Consider trailing stops for profitable positions")
         report.append("  4. Review positions with poor risk/reward ratios (<1.5:1)")
+        
+        # Add No-hedge Risk-Freeze block
+        report.append("\nNo-hedge Risk-Freeze:")
+        report.append(f"  Oversize: {analysis.get('oversize_ratio', float('nan')):.2f}x of optimal")
+        report.append(f"  Risk-Freeze: {'REQUIRED' if analysis.get('risk_freeze_required') else 'Optional'}")
+        dm = analysis.get('delta_margin', {}) or {}
+        if dm:
+            if not math.isnan(dm.get('delta_margin_needed', float('nan'))):
+                report.append(f"  ΔMargin_needed: ${dm.get('delta_margin_needed', 0):.2f} → target_lev = {dm.get('target_leverage', 0):.1f}x")
+        ladder = analysis.get('reduce_only_ladder', {}) or {}
+        if ladder:
+            report.append("  Reduce-only ladder:")
+            report.append(f"    p1=entry (${ladder.get('p1_price', 0):.6f}) ({int(ladder.get('p1_frac',0)*100)}%)")
+            report.append(f"    p2=entry+0.5R (${ladder.get('p2_price', 0):.6f}) ({int(ladder.get('p2_frac',0)*100)}%)")
+            report.append(f"    p3=TP1 (${ladder.get('p3_price', 0):.6f}) ({int(ladder.get('p3_frac',0)*100)}%)")
+        ts = analysis.get('time_stop', {}) or {}
+        if ts:
+            report.append(f"  Time-stop: streak={ts.get('bars_underwater_streak', 0)} bars; cap={ts.get('time_stop_bars', 0)}; hit={bool(ts.get('time_stop_hit', False))}")
+        funding = analysis.get('funding', {}) or {}
+        if funding and not math.isnan(funding.get('funding_rate_daily', float('nan'))):
+            report.append(f"  Funding bleed: est daily = {funding.get('funding_rate_daily', 0)*100:.3f}% × notional → ${funding.get('est_daily_funding_cost', 0):.2f}")
+            if funding.get('funding_alert'):
+                report.append("    ⚠️  High funding: consider Exit Plan B if >2 days and still below entry")
+        
+        # Portfolio beta reducer recommendation
+        pbr = self.risk_analysis.get('portfolio_beta_reducer')
+        if pbr:
+            report.append("\nPortfolio Beta Reducer:")
+            report.append(f"  Target portfolio beta reduction: {pbr.get('target_reduction', 0)*100:.0f}%")
+            cands = pbr.get('candidates', [])
+            if cands:
+                top_names = ", ".join([c['symbol'] for c in cands[:5]])
+                report.append(f"  Candidates to trim (ranked): {top_names} ...")
         
         return "\n".join(report)
     

@@ -46,3 +46,14 @@ horizon_hours = 4
 corr_lookback_days = 60
 corr_threshold = 0.7
 cluster_risk_cap_pct = 0.5
+
+[risk_freeze]
+# Defaults for “No-hedge Risk-Freeze” mode
+# Target leverage used to compute ΔMargin_needed
+target_leverage = 8.0
+# Funding alert threshold per day (e.g., 0.002 = 0.20%/day)
+funding_daily_alert_threshold = 0.002
+# Time-stop bars (e.g., 24 bars on 4h = 4 days)
+time_stop_bars = 24
+# Target portfolio beta reduction for recommendations (fraction)
+portfolio_beta_target_reduction = 0.40
