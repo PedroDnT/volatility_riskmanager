@@ -1,0 +1,40 @@
+{
+  "generated_at_utc": "2025-08-12T11:33:52.894241+00:00",
+  "window_days": 7,
+  "entries": [
+    {
+      "datetime": "2025-08-06T04:09:38.000Z",
+      "currency": "SOL",
+      "amount": 1.4,
+      "usd_px_at_time": 161.38,
+      "usd_value": 225.932,
+      "txid": "5ASzGtqetxJAjenVTdS5w8xQNwToXyKScyLn82Byv3QKZ6hp24pALizxMRw5rn2xLxJv1cTws6p6rqXwyrFHdpDM",
+      "id": "194215487",
+      "network": "SOL",
+      "source": "onchain"
+    },
+    {
+      "datetime": "2025-08-12T04:04:09.000Z",
+      "currency": "USDC",
+      "amount": 92.633111,
+      "usd_px_at_time": 1.0,
+      "usd_value": 92.633111,
+      "txid": "0x75eaeaf3a505da94af3350f94725dc5d0284e1e58a32185d862e2bdc6a20e5cf",
+      "id": "195639241",
+      "network": "BASE",
+      "source": "onchain"
+    },
+    {
+      "datetime": "2025-08-12T04:27:58.000Z",
+      "currency": "USDC",
+      "amount": 0.000182,
+      "usd_px_at_time": 1.0,
+      "usd_value": 0.000182,
+      "txid": "0xb4e874dabfc79f47711dd7d0f2fb3ffdc3dde248f90134d9af3605a45232bc96",
+      "id": "195641621",
+      "network": "BASE",
+      "source": "onchain"
+    }
+  ],
+  "total_usd_7d": 318.565293
+}
