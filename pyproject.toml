@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adv-crypto-risk-manager"
+version = "0.1.0"
+authors = [
+  { name="Jules", email="jules@example.com" },
+]
+description = "A comprehensive cryptocurrency trading risk management system that combines real-time position monitoring with advanced volatility analysis."
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "ccxt>=4.3.95",
+    "pandas>=2.2.2",
+    "numpy>=1.26.4",
+    "python-dotenv>=1.0.0",
+    "arch>=5.0.0",
+    "tomli; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.2.2",
+]
+
+[project.scripts]
+risk-manager = "position_risk_manager:main"
+
+[tool.setuptools]
+py-modules = ["position_risk_manager", "garch_vol_triggers", "get_position", "atr_sl_gpt"]
+

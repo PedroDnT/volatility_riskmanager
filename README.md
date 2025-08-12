@@ -31,45 +31,72 @@ market_analysis/
 
 ## 🚀 Quick Start
 
-### Installation
+There are two ways to run the application: directly via `pip` or using Docker.
+
+### 1. Local Installation & Execution
+
+#### Installation
+
+First, clone the repository and navigate into the directory. It is recommended to use a virtual environment.
 
 ```bash
-# Clone and setup
 git clone <repository>
-cd market_analysis
+cd <repository-folder>
 
-# Create virtual environment
+# Create and activate a virtual environment
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
-# Install dependencies
-pip install -r requirements.txt
+# Install the package in editable mode
+pip install -e .
 ```
+Installing with `-e .` makes the `risk-manager` command available on your path and reflects any code changes you make immediately.
 
-### Configuration
+#### Configuration
 
-1. Copy `settings.example.toml` to `settings.toml`
-2. Add your Bybit API credentials:
-```toml
-[bybit]
-api_key = "your_api_key"
-api_secret = "your_api_secret"
-sandbox = false  # Set to true for testnet
-```
+1.  Copy `settings.example.toml` to `settings.toml`.
+2.  Add your Bybit API credentials to `settings.toml`.
+3.  Create a `.env` file in the root directory with your API credentials (this is read by the application):
+    ```
+    BYBIT_API_KEY=your_api_key_here
+    BYBIT_API_SECRET=your_api_secret_here
+    ```
 
-### Run Position Risk Analysis
+#### Running the Application
+
+Once installed, you can run the analysis using the new command-line tool:
 
 ```bash
-python position_risk_manager.py
+risk-manager
 ```
+
+### 2. Docker Execution
+
+Alternatively, you can use Docker to build and run the application in a containerized environment.
+
+#### Building the Image
+
+From the project root directory, build the Docker image:
+```bash
+docker build -t risk-manager-app .
+```
+
+#### Running the Container
+
+Run the application inside a Docker container. You will need to mount your `.env` file and `settings.toml` into the container so it can access your configuration and API keys.
+
+```bash
+docker run --rm -v "$(pwd)/.env":/app/.env -v "$(pwd)/settings.toml":/app/settings.toml risk-manager-app
+```
+The `--rm` flag will automatically remove the container when it exits. The `-v` flags mount your local configuration files into the container at runtime.
 
 ### 🔬 Running Tests
 
 A suite of unit tests is included to verify the core calculation logic. To run the tests:
 
-1.  Ensure you have installed all dependencies, including `pytest`:
+1.  Install the package in editable mode with the optional `test` dependencies:
     ```bash
-    pip install -r requirements.txt
+    pip install -e .[test]
     ```
 
 2.  Run the test suite from the project's root directory:

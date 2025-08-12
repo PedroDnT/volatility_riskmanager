@@ -362,7 +362,7 @@ def sl_tp_and_size(entry_price, sigma_H, k=1.2, m=2.0, side="long", R=100.0, tic
         "Q": Q
     }
 
-# ---------- New: trailing stop helper ----------
+# ---------- New:  stop helper ----------
 
 def compute_trailing_stop(entry: float, direction: str, atr: float, cfg: dict, r_unrealized: float) -> float:
     stops_cfg = (cfg or {}).get('stops', {})
