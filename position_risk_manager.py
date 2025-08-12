@@ -294,7 +294,7 @@ class PositionRiskManager:
         try:
             sigma_ann_har, sigma_H_har = sigma_ann_and_sigma_H_from_har(
                 df["close"], interval=timeframe, horizon_hours=H_hours
-            )
+            )       
             volatility_metrics['har_sigma_ann'] = sigma_ann_har
             volatility_metrics['har_sigma_H'] = sigma_H_har
         except Exception as e:
@@ -315,7 +315,10 @@ class PositionRiskManager:
                 print("  GARCH checks:", "; ".join(issues))
             volatility_metrics['garch_sigma_ann'] = sigma_ann_garch if garch_ok else None
             volatility_metrics['garch_sigma_H'] = sigma_H_garch if garch_ok else None
-        
+        except Exception as e:
+            print(f"  GARCH failed: {e}")
+            volatility_metrics['garch_sigma_ann'] = None
+            volatility_metrics['garch_sigma_H'] = None
         # Blend vols in absolute horizon units
         sigmaH_blend_abs = blended_sigma_h(
             volatility_metrics.get('garch_sigma_ann'),
