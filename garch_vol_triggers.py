@@ -327,26 +327,53 @@ def validate_garch_result(returns: np.ndarray, res, sigma_ann: float, horizon_ho
 
 # ---------- Dynamic SL/TP and Position Sizing (same as before, but helpers will be used upstream) ----------
 
-def sl_tp_and_size(entry_price, sigma_H, k=1.2, m=2.0, side="long", R=100.0, tick_size=None):
+def sl_tp_and_size(price=None, sigma_H=None, k=1.2, m=2.0, side="long", R=100.0, tick_size=None, **kwargs):
     """
-    entry_price: current/entry price
-    sigma_H: forecasted volatility for the chosen horizon in fractional terms
-    k: stop multiplier
-    m: TP multiplier
-    side: "long" or "short"
-    R: target dollar risk per position
-    tick_size: minimum price increment (optional, for rounding)
+    Calculate stop-loss, take-profit levels and position size based on volatility forecasts.
+    
+    This function uses current price anchoring for SL/TP calculations, providing more accurate
+    risk management by basing distances on live market prices rather than historical entry prices.
+    
+    Args:
+        price (float, optional): Current market price for SL/TP calculations. 
+                                If None, falls back to 'current_price' or 'entry_price' from kwargs
+        sigma_H (float): Forecasted volatility for the chosen horizon in fractional terms
+                        (e.g., 0.02 for 2% expected price movement)
+        k (float): Stop-loss multiplier. SL distance = k * sigma_H * price
+        m (float): Take-profit multiplier. TP distance = m * sigma_H * price  
+        side (str): Position direction - "long" or "short"
+        R (float): Target dollar risk per position (used for position sizing)
+        tick_size (float, optional): Minimum price increment for rounding levels
+        **kwargs: Backwards compatibility support for 'entry_price' and 'current_price'
+    
+    Returns:
+        dict: Contains 'SL', 'TP', 'SL_distance', 'TP_distance', and 'Q' (position size)
+        
+    Notes:
+        - Uses current price anchoring: SL/TP levels calculated from live market price
+        - Position sizing (Q) based on SL_distance to maintain consistent dollar risk
+        - Supports tick size rounding for exchange-specific precision requirements
+        - Backward compatible with entry_price parameter for legacy usage
     """
-    sigma_price = entry_price * sigma_H
+    # Handle backwards compatibility
+    if price is None:
+        if 'current_price' in kwargs:
+            price = kwargs['current_price']
+        elif 'entry_price' in kwargs:
+            price = kwargs['entry_price']
+        else:
+            raise ValueError("Must provide 'price', 'current_price', or 'entry_price'")
+    
+    sigma_price = price * sigma_H
     sl_distance = k * sigma_price
     tp_distance = m * sigma_price
 
     if side.lower() == "long":
-        sl = entry_price - sl_distance
-        tp = entry_price + tp_distance
+        sl = price - sl_distance
+        tp = price + tp_distance
     else:
-        sl = entry_price + sl_distance
-        tp = entry_price - tp_distance
+        sl = price + sl_distance
+        tp = price - tp_distance
 
     # Round to tick size if provided
     if tick_size:
@@ -426,25 +453,25 @@ def analyze_multiple_symbols_bybit(exchange: ccxt.Exchange, symbols=["BTC/USDT",
         live_price = get_live_price_bybit(exchange, symbol)
         if live_price is None:
             print(f"Warning: Could not get live price for {symbol}, using last close price")
-            entry_price = float(df["close"].iloc[-1])
+            current_price = float(df["close"].iloc[-1])
         else:
-            entry_price = live_price
-            print(f"Live price for {symbol}: ${entry_price:.2f}")
+            current_price = live_price
+            print(f"Live price for {symbol}: ${current_price:.2f}")
         
         # Blended sigma using ATR abs
         atr = float(df["ATR20"].iloc[-1])
         cfg = load_settings()
-        sigmaH_blend_abs = blended_sigma_h(sigma_ann_garch, sigma_ann_har, atr_abs=atr, price=entry_price, cfg=cfg)
-        sigmaH_blend_frac = sigmaH_blend_abs / entry_price
+        sigmaH_blend_abs = blended_sigma_h(sigma_ann_garch, sigma_ann_har, atr_abs=atr, price=current_price, cfg=cfg)
+        sigmaH_blend_frac = sigmaH_blend_abs / current_price
         
         risk_R = 200.0
         
         strategies = {}
-        strategies["VOL_BLEND"] = sl_tp_and_size(entry_price, sigma_H=sigmaH_blend_frac, k=1.2, m=2.2, side="long", R=risk_R, tick_size=tick_size)
+        strategies["VOL_BLEND"] = sl_tp_and_size(current_price, sigma_H=sigmaH_blend_frac, k=1.2, m=2.2, side="long", R=risk_R, tick_size=tick_size)
         
         results[symbol] = {
             'market_info': market_info,
-            'entry_price': entry_price,
+            'entry_price': current_price,
             'strategies': strategies,
             'sigma_ann_har': sigma_ann_har if sigma_ann_har else None,
             'sigma_ann_garch': sigma_ann_garch if sigma_ann_garch else None,
@@ -497,17 +524,17 @@ if __name__ == "__main__":
         live_price = get_live_price_bybit(exchange, "BTC/USDT")
         if live_price is None:
             print(f"Warning: Could not get live price, using last close price")
-            entry_price = float(df["close"].iloc[-1])
+            current_price = float(df["close"].iloc[-1])
         else:
-            entry_price = live_price
-            print(f"Live BTC price: ${entry_price:.2f}")
+            current_price = live_price
+            print(f"Live BTC price: ${current_price:.2f}")
         
         # Use blended vol
         cfg = load_settings()
         atr_val = float(df["ATR20"].iloc[-1])
         sigma_ann_garch, sigma_H_garch, garch_res = garch_sigma_ann_and_sigma_H(df["close"], interval="4h", horizon_hours=H_hours)
-        sigmaH_blend_abs = blended_sigma_h(sigma_ann_garch, sigma_ann_har, atr_abs=atr_val, price=entry_price, cfg=cfg)
-        params = sl_tp_and_size(entry_price, sigma_H=(sigmaH_blend_abs/entry_price), k=1.2, m=2.2, side="long", R=200.0, 
+        sigmaH_blend_abs = blended_sigma_h(sigma_ann_garch, sigma_ann_har, atr_abs=atr_val, price=current_price, cfg=cfg)
+        params = sl_tp_and_size(current_price, sigma_H=(sigmaH_blend_abs/current_price), k=1.2, m=2.2, side="long", R=200.0, 
                                tick_size=market_info['tick_size'] if market_info else None)
         print(f"Dynamic SL/TP (blended): {params}")
     

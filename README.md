@@ -31,7 +31,45 @@ market_analysis/
 
 ## 🚀 Quick Start
 
-There are two ways to run the application: directly via `pip` or using Docker.
+There are three ways to use the application: **Web Dashboard** (recommended), **CLI tool**, or **Docker**.
+
+### 🌐 Web Dashboard (Recommended)
+
+**Deploy to Render in 2 minutes:**
+
+1. **One-Click Deploy**: 
+   [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
+
+2. **Manual Setup**:
+   - Fork this repository
+   - Connect to [Render](https://render.com)
+   - Set environment variables: `BYBIT_API_KEY`, `BYBIT_API_SECRET`
+   - Deploy automatically
+
+**Features:**
+- 📊 Real-time dashboard with live position monitoring
+- 📈 Interactive volatility charts and risk metrics
+- 📱 Mobile-responsive design
+- 🔄 Auto-refresh every 5 minutes
+- 📁 Export analysis to JSON
+- 🧪 Sandbox/Live mode toggle
+
+**Local Web Development:**
+```bash
+git clone <repository>
+cd <repository-folder>
+pip install -r requirements.txt
+
+# Set up environment variables
+cp .env.example .env
+# Edit .env with your API credentials
+
+# Run web server
+python app.py
+# Access at http://localhost:8000
+```
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for detailed deployment guide.
 
 ### 1. Local Installation & Execution
 

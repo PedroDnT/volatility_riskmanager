@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: crypto-risk-manager
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: BYBIT_API_KEY
+        sync: false
+      - key: BYBIT_API_SECRET
+        sync: false
+      - key: PORT
+        value: 8000
+    healthCheckPath: /api/health
+    domains:
+      - crypto-risk-manager.onrender.com

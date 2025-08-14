@@ -63,6 +63,7 @@ def fetch_bybit_positions(exchange: ccxt.Exchange) -> List[Dict[str, Any]]:
                     'size': pos['contracts'],
                     'notional': pos['notional'],
                     'entryPrice': pos['entryPrice'],
+                    'avgPrice': pos.get('info', {}).get('avgPrice'),
                     'markPrice': pos['markPrice'],
                     'unrealizedPnl': pos['unrealizedPnl'],
                     'percentage': percentage,

@@ -201,6 +201,30 @@ class PositionRiskManager:
             'time_stop_bars': int(self._time_stop_bars),
             'time_stop_hit': bool(time_stop_hit),
         }
+
+    def _calculate_breakeven_price(self, position: Dict[str, Any]) -> Optional[float]:
+        """Calculate the breakeven price including estimated fees."""
+        try:
+            avg_price_str = position.get('avgPrice')
+            if not avg_price_str:
+                return None
+            
+            avg_price = float(avg_price_str)
+            side = position.get('side', '').lower()
+            
+            # Estimate taker fees (e.g., 0.055% for Bybit)
+            taker_fee = self.cfg.get('fees', {}).get('taker_fee', 0.00055)
+            
+            if side == 'long':
+                # Breakeven is slightly above avgPrice to cover entry and exit fees
+                return avg_price * (1 + 2 * taker_fee)
+            elif side == 'short':
+                # Breakeven is slightly below avgPrice
+                return avg_price * (1 - 2 * taker_fee)
+            else:
+                return None
+        except (ValueError, TypeError):
+            return None
     
     def fetch_positions(self) -> List[Dict[str, Any]]:
         """Fetch current open positions."""
@@ -220,15 +244,35 @@ class PositionRiskManager:
     def analyze_position_volatility(self, position: Dict[str, Any], 
                                    timeframe: str = "4h", 
                                    lookback_days: int = 30) -> Dict[str, Any]:
-        """Analyze volatility for a single position.
+        """Analyze volatility and generate risk management parameters for a single position.
+        
+        This function implements current-price anchoring for SL/TP calculations, providing
+        more accurate risk assessment by using live market prices rather than outdated entry prices.
+        It provides dual reporting: both entry-based metrics (for backward compatibility) and
+        current-price based metrics (for enhanced accuracy).
         
         Args:
-            position: Position data dictionary
-            timeframe: Timeframe for volatility analysis
-            lookback_days: Days of historical data to analyze
+            position: Position data dictionary containing symbol, side, entryPrice, etc.
+            timeframe: Timeframe for volatility analysis (default: "4h")
+            lookback_days: Days of historical data to analyze (default: 30)
             
         Returns:
-            Dictionary with volatility metrics and recommended SL/TP levels
+            Dictionary containing comprehensive risk analysis including:
+            - Volatility metrics (GARCH, HAR-RV, blended forecasts)
+            - Current-price anchored SL/TP levels and distances
+            - Dual percentage reporting (entry-based and current-based)
+            - Position sizing recommendations
+            - Risk/reward ratios
+            - Confidence scoring and regime analysis
+            - Scale-out ladders and trailing stop suggestions
+            - Liquidation buffer analysis
+            - Portfolio risk metrics and correlation analysis
+            
+        Notes:
+            - Primary anchor: Uses current live market price for SL/TP calculations
+            - Dual reporting: Provides both 'sl_pct_entry'/'sl_pct_current' metrics
+            - Enhanced accuracy: Live price anchoring reduces lag in volatile markets
+            - Backward compatibility: Maintains legacy entry-based percentage keys
         """
         symbol = position['symbol']
         side = position['side'].lower()
@@ -283,6 +327,9 @@ class PositionRiskManager:
         live_price = get_live_price_bybit(self.exchange, symbol)
         if live_price is None:
             live_price = float(df["close"].iloc[-1])
+        
+        # Capture current price reference for position analysis (fallback to last close)
+        current_price = live_price
         # Compute time-stop counters (bars below/above entry)
         ts = self._time_stop_counters(df, entry_price=entry_price, side=side)
         
@@ -319,15 +366,24 @@ class PositionRiskManager:
             print(f"  GARCH failed: {e}")
             volatility_metrics['garch_sigma_ann'] = None
             volatility_metrics['garch_sigma_H'] = None
-        # Blend vols in absolute horizon units
-        sigmaH_blend_abs = blended_sigma_h(
+        # Blend vols in absolute horizon units, once for entry price, once for current price
+        sigmaH_blend_abs_entry = blended_sigma_h(
             volatility_metrics.get('garch_sigma_ann'),
             volatility_metrics.get('har_sigma_ann'),
             atr_abs=atr,
-            price=entry_price,
+            price=entry_price,  # Use entry_price for stable, entry-anchored calculations
             cfg=self.cfg
         )
-        primary_sigma_frac = sigmaH_blend_abs / entry_price
+        primary_sigma_frac_entry = sigmaH_blend_abs_entry / entry_price if entry_price > 0 else 0
+
+        sigmaH_blend_abs_current = blended_sigma_h(
+            volatility_metrics.get('garch_sigma_ann'),
+            volatility_metrics.get('har_sigma_ann'),
+            atr_abs=atr,
+            price=current_price,  # Use current_price for live, accurate calculations
+            cfg=self.cfg
+        )
+        primary_sigma_frac = sigmaH_blend_abs_current / current_price if current_price > 0 else 0
         vol_method = "VOL_BLEND"
         
         # Enhanced confidence scoring with volatility analysis
@@ -444,15 +500,15 @@ class PositionRiskManager:
             m_tp_base = float(stops_cfg.get('m_tp_low', 4.5))    # Increased from 4.0
         
         # Volatility-based adjustments
-        atr_pct = (atr / entry_price) * 100
+        atr_pct_current = (atr / current_price) * 100 if current_price > 0 else 0
         vol_adjustment = 1.0
         
         # Adjust for extreme volatility (wider stops in high vol)
-        if atr_pct > 5.0:  # Very high volatility
+        if atr_pct_current > 5.0:  # Very high volatility
             vol_adjustment = 1.3
-        elif atr_pct > 3.0:  # High volatility
+        elif atr_pct_current > 3.0:  # High volatility
             vol_adjustment = 1.15
-        elif atr_pct < 1.0:  # Low volatility
+        elif atr_pct_current < 1.0:  # Low volatility
             vol_adjustment = 0.9
         
         # Confidence-based adjustments
@@ -469,7 +525,7 @@ class PositionRiskManager:
         # Calculate SL/TP levels with optimal position sizing
         target_risk_dollars = position['notional'] * risk_target_pct
         risk_params = sl_tp_and_size(
-            entry_price=entry_price,
+            current_price=current_price,
             sigma_H=primary_sigma_frac,
             k=k_sl_eff,
             m=m_tp_eff,
@@ -478,28 +534,29 @@ class PositionRiskManager:
             tick_size=tick_size
         )
         
-        # Scale-out ladder
+        # Scale-out ladder - using current_price anchor for consistency with SL/TP calculations
         scale_r1 = float(stops_cfg.get('scaleout_r1', 1.5))
         scale_r2 = float(stops_cfg.get('scaleout_r2', 3.0))
         frac1 = float(stops_cfg.get('scaleout_frac1', 0.4))
         frac2 = float(stops_cfg.get('scaleout_frac2', 0.3))
         frac_runner = float(stops_cfg.get('leave_runner_frac', 0.3))
-        R_unit = risk_params['SL_distance']
+        R_unit = risk_params['SL_distance']  # This is calculated from current_price
         if side == 'long':
-            tp1 = entry_price + scale_r1 * R_unit
-            tp2 = entry_price + scale_r2 * R_unit
+            tp1 = current_price + scale_r1 * R_unit
+            tp2 = current_price + scale_r2 * R_unit
         else:
-            tp1 = entry_price - scale_r1 * R_unit
-            tp2 = entry_price - scale_r2 * R_unit
-        # New: Reduce-only ladder (entry, entry+0.5R, TP1)
+            tp1 = current_price - scale_r1 * R_unit
+            tp2 = current_price - scale_r2 * R_unit
+        # New: Reduce-only ladder (entry designed, but using current_price for consistency)
+        # Note: p1 intentionally uses entry_price as this is the breakeven level by design
         if side == 'long':
-            ladder_p1 = entry_price
-            ladder_p2 = entry_price + 0.5 * R_unit
-            ladder_p3 = tp1
+            ladder_p1 = entry_price  # Breakeven level - entry-based by design
+            ladder_p2 = current_price + 0.5 * R_unit  # Current-price based
+            ladder_p3 = tp1  # Current-price based
         else:
-            ladder_p1 = entry_price
-            ladder_p2 = entry_price - 0.5 * R_unit
-            ladder_p3 = tp1
+            ladder_p1 = entry_price  # Breakeven level - entry-based by design
+            ladder_p2 = current_price - 0.5 * R_unit  # Current-price based
+            ladder_p3 = tp1  # Current-price based
         ladder_sizes = {
             'p1_frac': 0.40,
             'p2_frac': 0.30,
@@ -508,12 +565,12 @@ class PositionRiskManager:
         
         # Trailing stop suggestion (assume unrealized R from current price)
         if side == 'long':
-            r_unreal = max(0.0, (live_price - entry_price) / R_unit) if R_unit > 0 else 0.0
+            r_unreal = max(0.0, (current_price - entry_price) / R_unit) if R_unit > 0 else 0.0
         else:
-            r_unreal = max(0.0, (entry_price - live_price) / R_unit) if R_unit > 0 else 0.0
-        trail_suggestion = compute_trailing_stop(entry=live_price, direction=side, atr=atr, cfg=self.cfg, r_unrealized=r_unreal)
+            r_unreal = max(0.0, (entry_price - current_price) / R_unit) if R_unit > 0 else 0.0
+        trail_suggestion = compute_trailing_stop(entry=current_price, direction=side, atr=atr, cfg=self.cfg, r_unrealized=r_unreal)
         
-        # Check liquidation buffer if liquidation price exists
+        # Check liquidation buffer if liquidation price exists (using current_price anchor)
         liquidation_price = position.get('liquidationPrice')
         liq_buffer_safe = True
         liq_buffer_ratio = None
@@ -521,15 +578,15 @@ class PositionRiskManager:
         if liquidation_price:
             if side == 'long':
                 sl_to_liq_distance = abs(risk_params['SL'] - liquidation_price)
-                sl_to_entry_distance = abs(entry_price - risk_params['SL'])
-                if sl_to_entry_distance > 0:
-                    liq_buffer_ratio = sl_to_liq_distance / sl_to_entry_distance
+                sl_to_current_distance = abs(current_price - risk_params['SL'])  # Use current_price for consistency
+                if sl_to_current_distance > 0:
+                    liq_buffer_ratio = sl_to_liq_distance / sl_to_current_distance
                     liq_buffer_safe = risk_params['SL'] > liquidation_price * 1.1
             else:  # short
                 sl_to_liq_distance = abs(liquidation_price - risk_params['SL'])
-                sl_to_entry_distance = abs(risk_params['SL'] - entry_price)
-                if sl_to_entry_distance > 0:
-                    liq_buffer_ratio = sl_to_liq_distance / sl_to_entry_distance
+                sl_to_current_distance = abs(risk_params['SL'] - current_price)  # Use current_price for consistency
+                if sl_to_current_distance > 0:
+                    liq_buffer_ratio = sl_to_liq_distance / sl_to_current_distance
                     liq_buffer_safe = risk_params['SL'] < liquidation_price * 0.9
         
         # Calculate dollar risk and reward using OPTIMAL position size
@@ -549,34 +606,49 @@ class PositionRiskManager:
         # New: Funding bleed estimate
         funding = self._estimate_funding_daily_cost(symbol=symbol, notional=position['notional'])
         
-        if side == 'long':
-            optimal_dollar_risk = optimal_position_size * (entry_price - risk_params['SL'])
-            optimal_dollar_reward = optimal_position_size * (risk_params['TP'] - entry_price)
-            sl_pct = ((risk_params['SL'] - entry_price) / entry_price) * 100
-            tp_pct = ((risk_params['TP'] - entry_price) / entry_price) * 100
-        else:
-            optimal_dollar_risk = optimal_position_size * (risk_params['SL'] - entry_price)
-            optimal_dollar_reward = optimal_position_size * (entry_price - risk_params['TP'])
-            sl_pct = ((entry_price - risk_params['SL']) / entry_price) * 100
-            tp_pct = ((entry_price - risk_params['TP']) / entry_price) * 100
+        # New: Calculate breakeven price
+        breakeven_price = self._calculate_breakeven_price(position)
         
-        # Risk/Reward for current position size
+        # Calculate percentage distances from entry price (stable, backward-compatible)
         if side == 'long':
-            current_dollar_risk = current_position_size * (entry_price - risk_params['SL'])
-            current_dollar_reward = current_position_size * (risk_params['TP'] - entry_price)
-        else:
-            current_dollar_risk = current_position_size * (risk_params['SL'] - entry_price)
-            current_dollar_reward = current_position_size * (entry_price - risk_params['TP'])
+            sl_pct = - (k_sl_eff * primary_sigma_frac_entry) * 100
+            tp_pct = (m_tp_eff * primary_sigma_frac_entry) * 100
+        else:  # short
+            sl_pct = (k_sl_eff * primary_sigma_frac_entry) * 100
+            tp_pct = - (m_tp_eff * primary_sigma_frac_entry) * 100
+
+        # Calculate percentage distances from CURRENT price (for live, accurate metrics)
+        if side == 'long':
+            sl_pct_curr = ((risk_params['SL'] - current_price) / current_price) * 100
+            tp_pct_curr = ((risk_params['TP'] - current_price) / current_price) * 100
+        else:  # short
+            sl_pct_curr = ((risk_params['SL'] - current_price) / current_price) * 100
+            tp_pct_curr = ((risk_params['TP'] - current_price) / current_price) * 100
+
+        # Calculate dollar risk and reward based on current price anchor
+        R_unit_current = abs(risk_params['SL'] - current_price)
         
-        dollar_risk = optimal_dollar_risk
-        dollar_reward = optimal_dollar_reward
+        # For current position size
+        current_position_size = position['size']
+        if side == 'long':
+            current_dollar_risk = current_position_size * R_unit_current
+            current_dollar_reward = current_position_size * (risk_params['TP'] - current_price)
+        else:
+            current_dollar_risk = current_position_size * R_unit_current
+            current_dollar_reward = current_position_size * (current_price - risk_params['TP'])
+
+        # For optimal position size
+        optimal_position_size = risk_params['Q']
+        dollar_risk = optimal_position_size * R_unit_current
+        dollar_reward = (dollar_risk / risk_params['SL_distance']) * risk_params['TP_distance'] if risk_params['SL_distance'] > 0 else 0
+        
         rr_ratio = dollar_reward / dollar_risk if dollar_risk > 0 else 0
         
         return {
             'symbol': symbol,
             'side': side,
             'entry_price': entry_price,
-            'current_price': live_price,
+            'current_price': current_price,
             'position_size': current_position_size,
             'optimal_position_size': optimal_position_size,
             'notional': position['notional'],
@@ -584,6 +656,7 @@ class PositionRiskManager:
             'current_pnl': position.get('unrealizedPnl', 0),
             'current_pnl_pct': position.get('percentage', 0),
             'liquidation_price': liquidation_price,
+            'breakeven_price': breakeven_price,
             
             # Volatility metrics
             'atr': atr,
@@ -592,7 +665,7 @@ class PositionRiskManager:
             'sigma_H': primary_sigma_frac,
             'har_sigma_ann': volatility_metrics.get('har_sigma_ann'),
             'garch_sigma_ann': volatility_metrics.get('garch_sigma_ann'),
-            'sigmaH_blend_abs': sigmaH_blend_abs,
+            'sigmaH_blend_abs': sigmaH_blend_abs_current,
             
             # Risk management levels
             'stop_loss': risk_params['SL'],
@@ -601,6 +674,15 @@ class PositionRiskManager:
             'tp_distance': risk_params['TP_distance'],
             'sl_pct': sl_pct,
             'tp_pct': tp_pct,
+            'sl_pct_curr': sl_pct_curr,
+            'tp_pct_curr': tp_pct_curr,
+            # Dual metrics - old keys (entry-based) for backward compatibility
+            'sl_pct_entry': sl_pct,
+            'tp_pct_entry': tp_pct,
+            # Dual metrics - new keys (current-based)
+            'sl_pct_current': sl_pct_curr,
+            'tp_pct_current': tp_pct_curr,
+            'anchor_price_used': 'current',
             'k_multiplier': k_sl_eff,
             'm_multiplier': m_tp_eff,
             
@@ -868,6 +950,8 @@ class PositionRiskManager:
             report.append(f"  Entry: ${analysis['entry_price']:.6f} | "
                          f"Current: ${analysis.get('current_price', 0):.6f} | "
                          f"PnL: {analysis.get('current_pnl_pct', 0):.2f}%")
+            if analysis.get('breakeven_price'):
+                report.append(f"  Breakeven (est.): ${analysis['breakeven_price']:.6f}")
             report.append(f"  Size: {analysis['position_size']} | "
                          f"Notional: ${analysis['notional']:.2f} | "
                          f"Leverage: {analysis['leverage']}x")
@@ -887,7 +971,7 @@ class PositionRiskManager:
             
             # Risk management recommendations
             report.append("\n🎯 Recommended Levels:")
-            report.append(f"  STOP LOSS: ${analysis['stop_loss']:.6f} ({analysis['sl_pct']:.2f}% from entry)")
+            report.append(f"  STOP LOSS: ${analysis['stop_loss']:.6f} ({analysis['sl_pct']:.2f}% from entry, {analysis.get('sl_pct_curr', 0):.2f}% from current)")
             report.append(f"    💰 Optimal Risk: ${analysis['dollar_risk']:.2f} (for optimal size: {analysis.get('optimal_position_size', 0):.2f})")
             report.append(f"    💰 Current Risk: ${analysis.get('current_dollar_risk', 0):.2f} (for current size: {analysis['position_size']:.2f})")
             if analysis.get('liquidation_buffer_safe') is not None:
@@ -895,7 +979,7 @@ class PositionRiskManager:
                     report.append(f"    ✅ Safe from liquidation")
                 else:
                     report.append(f"    ⚠️  TOO CLOSE TO LIQUIDATION!")
-            report.append(f"  TAKE PROFIT: ${analysis['take_profit']:.6f} ({analysis['tp_pct']:.2f}% from entry)")
+            report.append(f"  TAKE PROFIT: ${analysis['take_profit']:.6f} ({analysis['tp_pct']:.2f}% from entry, {analysis.get('tp_pct_curr', 0):.2f}% from current)")
             report.append(f"    💰 Optimal Reward: ${analysis['dollar_reward']:.2f}")
             report.append(f"    💰 Current Reward: ${analysis.get('current_dollar_reward', 0):.2f}")
             report.append(f"    📊 Risk/Reward: {analysis['risk_reward_ratio']:.2f}:1")

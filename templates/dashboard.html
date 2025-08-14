@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crypto Risk Management Dashboard</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Chart.js for data visualization -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+    
+    <!-- Font Awesome for icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+</head>
+<body class="bg-gray-900 text-white min-h-screen">
+    <!-- Navigation -->
+    <nav class="bg-gray-800 shadow-lg border-b border-gray-700">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between h-16">
+                <div class="flex items-center">
+                    <div class="flex-shrink-0">
+                        <i class="fas fa-chart-line text-blue-500 text-2xl"></i>
+                    </div>
+                    <div class="ml-3">
+                        <h1 class="text-xl font-bold text-white">Crypto Risk Management</h1>
+                        <p class="text-sm text-gray-400">Advanced Position Analysis</p>
+                    </div>
+                </div>
+                <div class="flex items-center space-x-4">
+                    <div id="status-indicator" class="flex items-center">
+                        <div class="w-3 h-3 rounded-full bg-gray-500 mr-2"></div>
+                        <span class="text-sm text-gray-400" id="status-text">Disconnected</span>
+                    </div>
+                    <button id="refresh-btn" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition-colors">
+                        <i class="fas fa-refresh mr-2"></i>Refresh
+                    </button>
+                    <button id="sandbox-toggle" class="bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded-lg transition-colors">
+                        <i class="fas fa-flask mr-2"></i>Sandbox
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        
+        <!-- Loading State -->
+        <div id="loading-state" class="text-center py-20">
+            <div class="animate-spin rounded-full h-32 w-32 border-b-2 border-blue-500 mx-auto"></div>
+            <p class="mt-4 text-gray-400">Analyzing positions...</p>
+        </div>
+
+        <!-- Error State -->
+        <div id="error-state" class="hidden bg-red-900 border border-red-600 rounded-lg p-4 mb-6">
+            <div class="flex items-center">
+                <i class="fas fa-exclamation-triangle text-red-400 mr-3"></i>
+                <div>
+                    <h3 class="text-red-300 font-semibold">Analysis Error</h3>
+                    <p class="text-red-200" id="error-message">An error occurred during analysis.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Dashboard Content -->
+        <div id="dashboard-content" class="hidden">
+            
+            <!-- Portfolio Summary Cards -->
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+                <!-- Total Positions -->
+                <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-gray-400 text-sm">Total Positions</p>
+                            <p class="text-2xl font-bold text-white" id="total-positions">0</p>
+                        </div>
+                        <div class="bg-blue-500 p-3 rounded-full">
+                            <i class="fas fa-layer-group text-white"></i>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Total PnL -->
+                <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-gray-400 text-sm">Total PnL</p>
+                            <p class="text-2xl font-bold" id="total-pnl">$0.00</p>
+                        </div>
+                        <div class="bg-green-500 p-3 rounded-full">
+                            <i class="fas fa-dollar-sign text-white"></i>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Portfolio R:R -->
+                <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-gray-400 text-sm">Portfolio R:R</p>
+                            <p class="text-2xl font-bold text-white" id="portfolio-rr">0:1</p>
+                        </div>
+                        <div class="bg-purple-500 p-3 rounded-full">
+                            <i class="fas fa-balance-scale text-white"></i>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- At Risk Positions -->
+                <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-gray-400 text-sm">At Risk</p>
+                            <p class="text-2xl font-bold text-red-400" id="positions-at-risk">0</p>
+                        </div>
+                        <div class="bg-red-500 p-3 rounded-full">
+                            <i class="fas fa-exclamation-triangle text-white"></i>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Positions Table -->
+            <div class="bg-gray-800 rounded-lg border border-gray-700 overflow-hidden mb-8">
+                <div class="px-6 py-4 border-b border-gray-700">
+                    <div class="flex justify-between items-center">
+                        <h2 class="text-xl font-semibold text-white">Position Analysis</h2>
+                        <div class="flex space-x-2">
+                            <button id="export-btn" class="bg-green-600 hover:bg-green-700 text-white px-3 py-1 rounded text-sm transition-colors">
+                                <i class="fas fa-download mr-1"></i>Export
+                            </button>
+                            <span class="text-sm text-gray-400" id="last-update">Last updated: Never</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="overflow-x-auto">
+                    <table class="min-w-full">
+                        <thead class="bg-gray-700">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">Symbol</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">Side</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">Entry</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">Current</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">PnL%</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">SL</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">TP</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">R:R</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">Health</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-300 uppercase tracking-wider">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="positions-table-body" class="bg-gray-800 divide-y divide-gray-700">
+                            <!-- Positions will be populated by JavaScript -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Volatility Chart -->
+            <div class="bg-gray-800 rounded-lg border border-gray-700 p-6">
+                <h3 class="text-lg font-semibold text-white mb-4">Volatility Analysis</h3>
+                <div class="h-64">
+                    <canvas id="volatility-chart"></canvas>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- Position Details Modal -->
+    <div id="position-modal" class="hidden fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+        <div class="bg-gray-800 rounded-lg max-w-4xl w-full max-h-screen overflow-y-auto">
+            <div class="px-6 py-4 border-b border-gray-700 flex justify-between items-center">
+                <h3 class="text-xl font-semibold text-white" id="modal-title">Position Details</h3>
+                <button id="close-modal" class="text-gray-400 hover:text-white">
+                    <i class="fas fa-times text-xl"></i>
+                </button>
+            </div>
+            <div class="p-6" id="modal-content">
+                <!-- Position details will be populated by JavaScript -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div id="toast-container" class="fixed top-4 right-4 z-50"></div>
+
+    <!-- JavaScript -->
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
