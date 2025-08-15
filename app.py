@@ -260,5 +260,7 @@ if __name__ == "__main__":
         "app:app",
         host="0.0.0.0",
         port=port,
-        reload=True if os.getenv("ENVIRONMENT") == "development" else False
+        reload=True if os.getenv("ENVIRONMENT") == "development" else False,
+
+        limit_max_requests_jitter_backoff_factor=100,
     )
