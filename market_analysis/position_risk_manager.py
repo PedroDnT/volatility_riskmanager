@@ -22,16 +22,12 @@ import numpy as np
 import ccxt
 from dotenv import load_dotenv
 
-try:
-    import tomllib
-except Exception:
-    tomllib = None
-
 # Import position fetching functionality
-from get_position import fetch_bybit_positions
+from .get_position import fetch_bybit_positions
+from .config import settings
 
 # Import volatility analysis functions
-from garch_vol_triggers import (
+from .garch_vol_triggers import (
     get_klines_bybit,
     get_live_price_bybit,
     get_bybit_market_info,
@@ -43,30 +39,10 @@ from garch_vol_triggers import (
     validate_garch_result,
     compute_trailing_stop
 )
+from .utils import _hours_per_bar
+from .confidence import calculate_confidence_score
+from .reporting import generate_report, _calculate_portfolio_metrics
 
-def load_settings(path: str = "settings.toml") -> dict:
-    if not tomllib:
-        return {}
-    try:
-        with open(path, "rb") as f:
-            return tomllib.load(f)
-    except Exception:
-        try:
-            with open("settings.example.toml", "rb") as f:
-                return tomllib.load(f)
-        except Exception:
-            return {}
-
-def _hours_per_bar(timeframe: str) -> int:
-    try:
-        if timeframe.endswith('h'):
-            return int(timeframe[:-1])
-        if timeframe.endswith('d'):
-            return int(timeframe[:-1]) * 24
-    except Exception:
-        pass
-    # default to 4h if unknown
-    return 4
 
 class PositionRiskManager:
     """Manages risk analysis for all open positions."""
@@ -80,7 +56,7 @@ class PositionRiskManager:
         self.sandbox = sandbox
         self.positions = []
         self.risk_analysis = {}
-        self.cfg = load_settings()
+        self.cfg = settings
         
         # Centralized exchange object creation
         load_dotenv()
@@ -227,77 +203,7 @@ class PositionRiskManager:
         vol_method = "VOL_BLEND"
         
         # Enhanced confidence scoring with volatility analysis
-        score = 0
-        confidence_factors = []
-        try:
-            close = df['close']
-            
-            # 1. Trend strength (EMA crossover)
-            ema20 = close.ewm(span=20, adjust=False).mean()
-            ema50 = close.ewm(span=50, adjust=False).mean()
-            if side == 'long' and ema20.iloc[-1] > ema50.iloc[-1]:
-                score += 1
-                confidence_factors.append("Uptrend (EMA20 > EMA50)")
-            elif side == 'short' and ema20.iloc[-1] < ema50.iloc[-1]:
-                score += 1
-                confidence_factors.append("Downtrend (EMA20 < EMA50)")
-            
-            # 2. Breakout confirmation (Donchian channels)
-            donch_high = df['high'].rolling(window=20, min_periods=20).max()
-            donch_low  = df['low'].rolling(window=20, min_periods=20).min()
-            if side == 'long' and close.iloc[-1] > donch_high.iloc[-2]:
-                score += 1
-                confidence_factors.append("Breakout above Donchian high")
-            elif side == 'short' and close.iloc[-1] < donch_low.iloc[-2]:
-                score += 1
-                confidence_factors.append("Breakout below Donchian low")
-            
-            # 3. Volatility regime analysis
-            rets = np.log(close).diff()
-            vol_20 = rets.rolling(window=20).std()
-            vol_100 = rets.rolling(window=100).std()
-            current_vol = float(vol_20.iloc[-1])
-            avg_vol = float(vol_100.median())
-            
-            # Low volatility = higher confidence (less noise)
-            if current_vol < avg_vol * 0.8:
-                score += 1
-                confidence_factors.append("Low volatility regime")
-            elif current_vol > avg_vol * 1.5:
-                score -= 1  # High volatility reduces confidence
-                confidence_factors.append("High volatility regime")
-            
-            # 4. Price momentum (RSI proxy)
-            rsi_period = 14
-            gains = close.diff().where(close.diff() > 0, 0)
-            losses = -close.diff().where(close.diff() < 0, 0)
-            avg_gain = gains.rolling(window=rsi_period).mean()
-            avg_loss = losses.rolling(window=rsi_period).mean()
-            rs = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs))
-            
-            if side == 'long' and rsi.iloc[-1] > 50:
-                score += 1
-                confidence_factors.append("Positive momentum (RSI > 50)")
-            elif side == 'short' and rsi.iloc[-1] < 50:
-                score += 1
-                confidence_factors.append("Negative momentum (RSI < 50)")
-            
-            # 5. Volatility stability (GARCH validation)
-            if volatility_metrics.get('garch_sigma_ann') and volatility_metrics.get('har_sigma_ann'):
-                garch_har_ratio = volatility_metrics['garch_sigma_ann'] / volatility_metrics['har_sigma_ann']
-                if 0.5 <= garch_har_ratio <= 2.0:  # Models agree
-                    score += 1
-                    confidence_factors.append("Volatility models aligned")
-                elif garch_har_ratio > 3.0:  # High disagreement
-                    score -= 1
-                    confidence_factors.append("Volatility models disagree")
-            
-        except Exception as e:
-            print(f"  Confidence scoring error: {e}")
-        
-        # Clamp score to reasonable range
-        score = max(-2, min(5, score))
+        score, confidence_factors = calculate_confidence_score(df, side, volatility_metrics)
         
         # Enhanced dynamic risk management (2-3% based on confidence/volatility)
         risk_cfg = self.cfg.get('risk', {})
@@ -550,33 +456,7 @@ class PositionRiskManager:
     
     def _calculate_portfolio_metrics(self) -> Dict[str, Any]:
         """Calculate portfolio-wide risk metrics."""
-        total_notional = sum(p['notional'] for p in self.positions)
-        total_pnl = sum(p.get('unrealizedPnl', 0) for p in self.positions)
-        
-        total_dollar_risk = 0
-        total_dollar_reward = 0
-        positions_at_risk = []
-        
-        for symbol, analysis in self.risk_analysis.items():
-            if 'dollar_risk' in analysis:
-                total_dollar_risk += analysis['dollar_risk']
-                total_dollar_reward += analysis['dollar_reward']
-                
-                if analysis.get('position_health') in ['CRITICAL', 'WARNING']:
-                    positions_at_risk.append(symbol)
-        
-        portfolio_rr = total_dollar_reward / total_dollar_risk if total_dollar_risk > 0 else 0
-        
-        return {
-            'total_positions': len(self.positions),
-            'total_notional': total_notional,
-            'total_unrealized_pnl': total_pnl,
-            'total_risk_if_all_sl_hit': total_dollar_risk,
-            'total_reward_if_all_tp_hit': total_dollar_reward,
-            'portfolio_risk_reward_ratio': portfolio_rr,
-            'positions_at_risk': positions_at_risk,
-            'risk_pct_of_notional': (total_dollar_risk / total_notional * 100) if total_notional > 0 else 0
-        }
+        return _calculate_portfolio_metrics(self.positions, self.risk_analysis)
 
     def _apply_portfolio_correlation_cap(self) -> None:
         """Compute correlation clusters and cap cluster risk as per settings."""
@@ -644,149 +524,7 @@ class PositionRiskManager:
  
     def generate_report(self) -> str:
         """Generate comprehensive risk management report."""
-        if not self.risk_analysis:
-            return "No positions to analyze."
-        
-        report = []
-        report.append("=" * 80)
-        report.append("POSITION RISK MANAGEMENT REPORT")
-        report.append(f"Generated: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
-        report.append("=" * 80)
-        
-        # Portfolio summary
-        portfolio = self.risk_analysis.get('portfolio', {})
-        if 'portfolio' in self.risk_analysis:
-            report.append("\n📊 PORTFOLIO SUMMARY")
-            report.append("-" * 40)
-            report.append(f"Total Positions: {portfolio.get('total_positions', 0)}")
-            report.append(f"Total Notional: ${portfolio.get('total_notional', 0):,.2f}")
-            report.append(f"Total Unrealized PnL: ${portfolio.get('total_unrealized_pnl', 0):,.2f}")
-            report.append(f"Total Risk (if all SL hit): ${portfolio.get('total_risk_if_all_sl_hit', 0):,.2f}")
-            report.append(f"Total Reward (if all TP hit): ${portfolio.get('total_reward_if_all_tp_hit', 0):,.2f}")
-            report.append(f"Portfolio Risk/Reward: {portfolio.get('portfolio_risk_reward_ratio', 0):.2f}:1")
-            
-            if portfolio.get('positions_at_risk'):
-                report.append(f"\n⚠️  Positions at Risk: {', '.join(portfolio['positions_at_risk'])}")
-        
-        # Individual position analysis
-        report.append("\n" + "=" * 80)
-        report.append("INDIVIDUAL POSITION ANALYSIS")
-        report.append("=" * 80)
-        
-        for i, position in enumerate(self.positions, 1):
-            symbol = position['symbol']
-            analysis = self.risk_analysis.get(symbol, {})
-            
-            if not analysis or 'error' in analysis:
-                report.append(f"\nPosition {i}: {symbol}")
-                report.append("  ❌ Analysis failed - manual review required")
-                continue
-            
-            # Position header
-            report.append(f"\nPosition {i}: {symbol}")
-            report.append("-" * 40)
-            
-            # Current status
-            report.append("Current Status:")
-            report.append(f"  Entry: ${analysis['entry_price']:.6f} | "
-                         f"Current: ${analysis.get('current_price', 0):.6f} | "
-                         f"PnL: {analysis.get('current_pnl_pct', 0):.2f}%")
-            report.append(f"  Size: {analysis['position_size']} | "
-                         f"Notional: ${analysis['notional']:.2f} | "
-                         f"Leverage: {analysis['leverage']}x")
-            
-            if analysis.get('liquidation_price'):
-                report.append(f"  Liquidation Price: ${analysis['liquidation_price']:.6f}")
-            
-            # Volatility analysis
-            report.append("\nVolatility Analysis:")
-            report.append(f"  Method: {analysis['volatility_method']}")
-            report.append(f"  ATR(20): ${analysis.get('atr', 0):.6f} ({analysis.get('atr_pct', 0):.2f}% of price)")
-            if analysis.get('har_sigma_ann'):
-                report.append(f"  HAR-RV σ(annual): {analysis['har_sigma_ann']:.1%}")
-            if analysis.get('garch_sigma_ann'):
-                report.append(f"  GARCH σ(annual): {analysis['garch_sigma_ann']:.1%}")
-            report.append(f"  Vol blend (H={int(self.cfg.get('vol', {}).get('horizon_hours', 4))}h): {analysis.get('sigmaH_blend_abs', 0):.6f} abs")
-            
-            # Risk management recommendations
-            report.append("\n🎯 Recommended Levels:")
-            report.append(f"  STOP LOSS: ${analysis['stop_loss']:.6f} ({analysis['sl_pct']:.2f}% from entry)")
-            report.append(f"    💰 Optimal Risk: ${analysis['dollar_risk']:.2f} (for optimal size: {analysis.get('optimal_position_size', 0):.2f})")
-            report.append(f"    💰 Current Risk: ${analysis.get('current_dollar_risk', 0):.2f} (for current size: {analysis['position_size']:.2f})")
-            if analysis.get('liquidation_buffer_safe') is not None:
-                if analysis['liquidation_buffer_safe']:
-                    report.append(f"    ✅ Safe from liquidation")
-                else:
-                    report.append(f"    ⚠️  TOO CLOSE TO LIQUIDATION!")
-            report.append(f"  TAKE PROFIT: ${analysis['take_profit']:.6f} ({analysis['tp_pct']:.2f}% from entry)")
-            report.append(f"    💰 Optimal Reward: ${analysis['dollar_reward']:.2f}")
-            report.append(f"    💰 Current Reward: ${analysis.get('current_dollar_reward', 0):.2f}")
-            report.append(f"    📊 Risk/Reward: {analysis['risk_reward_ratio']:.2f}:1")
-
-            # Scale-outs and trailing
-            report.append("  Scale-outs:")
-            report.append(f"    • Close {analysis['scaleout_frac1']*100:.0f}% @ {analysis['tp1']:.6f}")
-            report.append(f"    • Close {analysis['scaleout_frac2']*100:.0f}% @ {analysis['tp2']:.6f}")
-            report.append(f"    • Leave {analysis['leave_runner_frac']*100:.0f}% runner; Trail suggestion: {analysis['trail_stop_suggestion']:.6f}")
-
-            # Professional confidence analysis
-            report.append("  Professional Analysis:")
-            report.append(f"    Confidence Score: {analysis['regime_score']}/5")
-            if analysis.get('confidence_factors'):
-                report.append(f"    Confidence Factors: {', '.join(analysis['confidence_factors'])}")
-            report.append(f"    Volatility Adjustment: {analysis.get('volatility_adjustment', 1.0):.2f}x")
-            report.append(f"    Confidence Adjustment: {analysis.get('confidence_adjustment', 1.0):.2f}x")
-            
-            # Risk management details
-            report.append("  Risk Management:")
-            report.append(f"    Risk Target: {analysis['risk_target_pct']*100:.2f}% of notional")
-            report.append(f"    Stop Loss: {analysis['k_multiplier']:.2f}× ATR (Professional: 2-4×)")
-            report.append(f"    Take Profit: {analysis['m_multiplier']:.2f}× ATR (Professional: 2.5-4.5×)")
-
-            # Portfolio cap note if present
-            if analysis.get('portfolio_note'):
-                report.append(f"  Portfolio cap: {analysis['portfolio_note']}")
-            
-            # Check if position size is significantly different from optimal
-            if analysis.get('optimal_position_size'):
-                size_ratio = analysis['position_size'] / analysis['optimal_position_size']
-                if size_ratio > 1.5:
-                    report.append(f"    ⚠️  POSITION SIZE TOO LARGE: Current is {size_ratio:.1f}x optimal")
-                elif size_ratio < 0.5:
-                    report.append(f"    ℹ️  POSITION SIZE SMALL: Current is {size_ratio:.1f}x optimal")
-            
-            # Position assessment
-            health_emoji = {
-                'CRITICAL': '🔴',
-                'WARNING': '🟡',
-                'NORMAL': '🟢',
-                'PROFITABLE': '💚',
-                'UNKNOWN': '⚪'
-            }
-            
-            report.append("\nRisk Assessment:")
-            report.append(f"  Status: {health_emoji.get(analysis.get('position_health','NORMAL'), '⚪')} "
-                         f"{analysis.get('position_health','NORMAL')}")
-            report.append(f"  Action: {analysis.get('action_required','Set SL/TP as recommended')}")
-        
-        # Final recommendations
-        report.append("\n" + "=" * 80)
-        report.append("RECOMMENDATIONS")
-        report.append("=" * 80)
-        
-        if portfolio.get('positions_at_risk'):
-            report.append("⚠️  IMMEDIATE ATTENTION REQUIRED:")
-            for symbol in portfolio['positions_at_risk']:
-                analysis = self.risk_analysis.get(symbol, {})
-                report.append(f"  • {symbol}: {analysis.get('action_required', 'Review position')}")
-        
-        report.append("\n✅ GENERAL GUIDELINES:")
-        report.append("  1. Set all stop losses immediately to protect capital")
-        report.append("  2. Monitor high-leverage positions (15x+) closely")
-        report.append("  3. Consider trailing stops for profitable positions")
-        report.append("  4. Review positions with poor risk/reward ratios (<1.5:1)")
-        
-        return "\n".join(report)
+        return generate_report(self.risk_analysis, self.positions, self.cfg)
     
     def export_to_json(self, filename: str = "risk_analysis.json"):
         """Export risk analysis to JSON file."""
@@ -801,49 +539,3 @@ class PositionRiskManager:
         
         print(f"\nRisk analysis exported to {filename}")
 
-
-def main():
-    """Main execution function."""
-    # Initialize risk manager
-    manager = PositionRiskManager(sandbox=False)
-    
-    # Fetch and analyze positions
-    positions = manager.fetch_positions()
-    
-    if not positions:
-        print("No positions to analyze. Exiting.")
-        return
-    
-    # Analyze all positions
-    manager.analyze_all_positions()
-    
-    # Generate and print report
-    report = manager.generate_report()
-    print("\n" + report)
-    
-    # Export to JSON
-    manager.export_to_json()
-    
-    # Print summary table
-    print("\n" + "=" * 80)
-    print("QUICK REFERENCE TABLE")
-    print("=" * 80)
-    print(f"{'Symbol':<15} {'Side':<5} {'Entry':<10} {'SL':<10} {'TP':<10} {'R:R':<6} {'Risk%':<7} {'k/m':<9}")
-    print("-" * 80)
-    
-    for position in positions:
-        symbol = position['symbol']
-        analysis = manager.risk_analysis.get(symbol, {})
-        
-        if analysis and 'stop_loss' in analysis:
-            print(f"{symbol:<15} {analysis['side'].upper():<5} "
-                  f"${analysis['entry_price']:<9.4f} "
-                  f"${analysis['stop_loss']:<9.4f} "
-                  f"${analysis['take_profit']:<9.4f} "
-                  f"{analysis['risk_reward_ratio']:<5.1f}:1 "
-                  f"{analysis['risk_target_pct']*100:<6.2f}% "
-                  f"{analysis['k_multiplier']:.1f}/{analysis['m_multiplier']:.1f}")
-
-
-if __name__ == "__main__":
-    main()

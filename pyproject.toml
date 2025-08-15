@@ -32,7 +32,9 @@ test = [
 ]
 
 [project.scripts]
-risk-manager = "position_risk_manager:main"
+risk-manager = "market_analysis.__main__:main"
 
-[tool.setuptools]
-py-modules = ["position_risk_manager", "garch_vol_triggers", "get_position", "atr_sl_gpt"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["market_analysis*"]
+exclude = ["tests*"]

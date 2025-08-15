@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from garch_vol_triggers import compute_atr, sl_tp_and_size
+from market_analysis.garch_vol_triggers import compute_atr, sl_tp_and_size
 from tests.test_data import ohlcv_sample_data
 
 def test_compute_atr():

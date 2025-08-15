@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from atr_sl_gpt import (
+from market_analysis.atr_sl_gpt import (
     compute_levels,
     position_size_usdt,
     atr_trailing_stop,
